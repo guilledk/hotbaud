@@ -1,13 +1,4 @@
-from .types import (
-    Buffer as Buffer,
-    SharedMemory as SharedMemory
-)
-from .eventfd import (
-    EFDReadCancelled as EFDReadCancelled,
-    EventFD as EventFD
-)
-
-from .memchan import (
+from ._impl import (
     MCToken as MCToken,
     alloc_memory_channel as alloc_memory_channel,
     open_memory_channel as open_memory_channel,
@@ -20,6 +11,7 @@ from .memchan import (
     attach_to_memory_channel as attach_to_memory_channel
 )
 
-from ._entrypoint import (
-    run_in_worker as run_in_worker
+from ._fans import (
+    FanOutSender as FanOutSender,
+    FanInReceiver as FanInReceiver
 )

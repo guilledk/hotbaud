@@ -37,7 +37,7 @@ EFD_CLOEXEC = 0o2000000
 EFD_NONBLOCK = 0o4000
 
 
-def open_eventfd(initval: int = 0, flags: int = 0) -> int:
+def open_eventfd(initval: int = 0, flags: int = EFD_NONBLOCK) -> int:
     '''
     Open an eventfd with the given initial value and flags.
     Returns the file descriptor on success, otherwise raises OSError.
@@ -146,13 +146,18 @@ class EventFD:
             raise trio.BusyResourceError
 
         async with self._read_lock:
+            value: int | None = None
             self._cscope = trio.CancelScope()
             with self._cscope:
                 try:
-                    return await trio.to_thread.run_sync(
-                        read_eventfd, self._fd,
-                        abandon_on_cancel=True
-                    )
+                    await trio.lowlevel.wait_readable(self._fd)
+                    value = self.read_nowait()
+
+                    # old thread based read:
+                    # return await trio.to_thread.run_sync(
+                    #     read_eventfd, self._fd,
+                    #     abandon_on_cancel=True
+                    # )
 
                 except OSError as e:
                     if e.errno != errno.EBADF:
@@ -160,10 +165,12 @@ class EventFD:
 
                     raise trio.BrokenResourceError
 
-            if self._cscope.cancelled_caught:
+            if value is None or self._cscope.cancelled_caught:
                 raise EFDReadCancelled
 
             self._cscope = None
+
+            return value
 
     def read_nowait(self) -> int:
         '''

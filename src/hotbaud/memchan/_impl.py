@@ -1,5 +1,5 @@
 '''
-IPC Reliable RingBuffer implementation
+IPC MemoryChannel implementation
 
 '''
 from __future__ import annotations
@@ -7,34 +7,30 @@ import os
 import struct
 import logging
 from typing import (
-    Any,
     AsyncGenerator,
-    Generator,
     TypeVar,
 )
 from contextlib import (
-    contextmanager as cm,
-    asynccontextmanager as acm
+    asynccontextmanager as acm,
+    suppress
 )
 from multiprocessing.shared_memory import SharedMemory
 
 import trio
-from msgspec import (
-    Struct,
-    to_builtins
-)
+from trio import socket
 from msgspec.msgpack import (
     Encoder,
     Decoder,
 )
 
+from hotbaud.types import Buffer
 from hotbaud.eventfd import (
     open_eventfd,
     EFDReadCancelled,
     EventFD
 )
-from hotbaud._utils import InternalError, disable_resource_tracker
-
+from hotbaud._utils import InternalError, MessageStruct, disable_resource_tracker
+from hotbaud._fdshare import maybe_open_fd_share_socket, recv_fds
 
 
 log = logging.getLogger(__name__)
@@ -45,13 +41,11 @@ disable_resource_tracker()
 _DEFAULT_RB_SIZE = 10 * 1024
 
 
-class RBToken(Struct, frozen=True):
+class MCToken(MessageStruct, frozen=True):
     '''
-    RingBuffer token contains necesary info to open resources of a ringbuf
+    MemoryChannel token contains necesary info to open resources of a channel
 
     '''
-    owner: str | None
-
     shm_name: str
 
     write_eventfd: int  # used to signal writer ptr advance
@@ -60,15 +54,7 @@ class RBToken(Struct, frozen=True):
 
     buf_size: int  # size in bytes of underlying shared memory buffer
 
-    def as_msg(self):
-        return to_builtins(self)
-
-    @classmethod
-    def from_msg(cls, msg: dict) -> RBToken:
-        if isinstance(msg, RBToken):
-            return msg
-
-        return RBToken(**msg)
+    share_path: str | None
 
     @property
     def fds(self) -> tuple[int, int, int]:
@@ -79,174 +65,82 @@ class RBToken(Struct, frozen=True):
         )
 
 
-def alloc_ringbuf(
+async def alloc_memory_channel(
     shm_name: str,
+    *,
     buf_size: int = _DEFAULT_RB_SIZE,
-) -> tuple[SharedMemory, RBToken]:
+    share_path: str | None = None
+) -> tuple[SharedMemory, MCToken, socket.SocketType | None]:
     '''
-    Allocate OS resources for a ringbuf.
+    Allocate OS resources for a memory channel.
+
     '''
     shm = SharedMemory(
         name=shm_name,
         size=buf_size,
         create=True
     )
-    token = RBToken(
-        owner=str(os.getpid()),
+    token = MCToken(
         shm_name=shm_name,
         write_eventfd=open_eventfd(),
         wrap_eventfd=open_eventfd(),
         eof_eventfd=open_eventfd(),
-        buf_size=buf_size
+        buf_size=buf_size,
+        share_path=share_path
     )
+    share_sock = None
+    if share_path:
+        share_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        await share_sock.bind(share_path)
+        share_sock.listen(1)
 
-    return shm, token
+    return shm, token, share_sock
 
 
-@cm
-def open_ringbuf_sync(
+@acm
+async def open_memory_channel(
     shm_name: str,
+    *,
     buf_size: int = _DEFAULT_RB_SIZE,
-) -> Generator[RBToken, Any, None]:
+    share_path: str | None = None
+) -> AsyncGenerator[MCToken]:
     '''
-    Handle resources for a ringbuf (shm, eventfd), yield `RBToken` to
-    be used with `attach_to_ringbuf_sender` and `attach_to_ringbuf_receiver`,
+    Handle resources for a mem-chan (shm, eventfd, share_sock), yield `MCToken`
+    to be used with `attach_to_memory_sender` and `attach_to_memory_receiver`,
     post yield maybe unshare fds and unlink shared memory
 
     '''
     shm: SharedMemory | None = None
-    token: RBToken | None = None
+    token: MCToken | None = None
+    sh_sock: socket.SocketType | None = None
     try:
-        shm, token = alloc_ringbuf(
+        shm, token, sh_sock = await alloc_memory_channel(
             shm_name,
             buf_size=buf_size,
+            share_path=share_path
         )
-        yield token
+        async with maybe_open_fd_share_socket(sh_sock, token.fds):
+            yield token
 
     finally:
         if shm:
-            shm.unlink()
+            with suppress(Exception):
+                shm.unlink()
 
-@acm
-async def open_ringbuf(
-    shm_name: str,
-    buf_size: int = _DEFAULT_RB_SIZE,
-) -> AsyncGenerator[RBToken]:
-    '''
-    Helper to use `open_ringbuf_sync` inside an async with block.
-
-    '''
-    with open_ringbuf_sync(
-        shm_name,
-        buf_size=buf_size,
-    ) as token:
-        yield token
-
-
-@cm
-def open_ringbufs_sync(
-    shm_names: list[str],
-    buf_sizes: int | list[str] = _DEFAULT_RB_SIZE,
-) -> Generator[tuple[RBToken, ...], Any, None]:
-    '''
-    Handle resources for multiple ringbufs at once.
-
-    '''
-    # maybe convert single int into list
-    if isinstance(buf_sizes, int):
-        buf_size = [buf_sizes] * len(shm_names)
-
-    # ensure len(shm_names) == len(buf_sizes)
-    if (
-        isinstance(buf_sizes, list)
-        and
-        len(buf_sizes) != len(shm_names)
-    ):
-        raise ValueError(
-            'Expected buf_size list to be same length as shm_names'
-        )
-
-    # allocate resources
-    rings: list[tuple[SharedMemory, RBToken]] = [
-        alloc_ringbuf(
-            shm_name,
-            buf_size=buf_size,
-        )
-        for shm_name, buf_size in zip(shm_names, buf_size)
-    ]
-
-    try:
-        yield tuple([token for _, token in rings])
-
-    finally:
-        # attempt fd unshare and shm unlink for each
-        for shm, token in rings:
-            shm.unlink()
-
-
-@acm
-async def open_ringbufs(
-    shm_names: list[str],
-    buf_sizes: int | list[str] = _DEFAULT_RB_SIZE,
-) -> AsyncGenerator[tuple[RBToken, ...]]:
-    '''
-    Helper to use `open_ringbufs_sync` inside an async with block.
-
-    '''
-    with open_ringbufs_sync(
-        shm_names,
-        buf_sizes=buf_sizes,
-    ) as tokens:
-        yield tokens
-
-
-@cm
-def open_ringbuf_pair_sync(
-    shm_name: str,
-    buf_size: int = _DEFAULT_RB_SIZE,
-) -> Generator[tuple[RBToken, RBToken], Any, None]:
-    '''
-    Handle resources for a ringbuf pair to be used for
-    bidirectional messaging.
-
-    '''
-    with open_ringbufs_sync(
-        [
-            f'{shm_name}.send',
-            f'{shm_name}.recv'
-        ],
-        buf_sizes=buf_size,
-    ) as tokens:
-        yield tokens[0], tokens[1]
-
-
-@acm
-async def open_ringbuf_pair(
-    shm_name: str,
-    buf_size: int = _DEFAULT_RB_SIZE,
-) -> AsyncGenerator[tuple[RBToken, RBToken]]:
-    '''
-    Helper to use `open_ringbuf_pair_sync` inside an async with block.
-
-    '''
-    with open_ringbuf_pair_sync(
-        shm_name,
-        buf_size=buf_size,
-    ) as tokens:
-        yield tokens
-
-
-Buffer = bytes | bytearray | memoryview
+        if sh_sock and share_path:
+            with suppress(Exception):
+                sh_sock.close()
+                os.unlink(share_path)
 
 
 '''
-IPC Reliable Ring Buffer
+IPC MemoryChannel
 
 `eventfd(2)` is used for wrap around sync, to signal writes to
 the reader and end of stream.
 
 In order to guarantee full messages are received, all bytes
-sent by `RingBufferSendChannel` are preceded with a 4 byte header
+sent by `MemorySendChannel` are preceded with a 4 byte header
 which decodes into a uint32 indicating the actual size of the
 next full payload.
 
@@ -256,12 +150,12 @@ next full payload.
 PayloadT = TypeVar('PayloadT')
 
 
-class RingBufferSendChannel(trio.abc.SendChannel[PayloadT]):
+class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
     '''
-    Ring Buffer sender side implementation
+    Memory channel sender side implementation
 
-    Do not use directly! manage with `attach_to_ringbuf_sender`
-    after having opened a ringbuf context with `open_ringbuf`.
+    Do not use directly! manage with `attach_to_memory_sender`
+    after having opened a mem-chan context with `open_memory_channel`.
 
     Optional batch mode:
 
@@ -275,15 +169,15 @@ class RingBufferSendChannel(trio.abc.SendChannel[PayloadT]):
     '''
     def __init__(
         self,
-        token: RBToken,
+        token: MCToken,
         batch_size: int = 1,
         cleanup: bool = False,
         encoder: Encoder | None = None
     ):
-        self._token = RBToken.from_msg(token)
+        self._token = MCToken.from_msg(token)
         self.batch_size = batch_size
 
-        # ringbuf os resources
+        # mem-chan os resources
         self._shm: SharedMemory | None = None
         self._write_event = EventFD(self._token.write_eventfd, 'w')
         self._wrap_event = EventFD(self._token.wrap_eventfd, 'r')
@@ -301,7 +195,7 @@ class RingBufferSendChannel(trio.abc.SendChannel[PayloadT]):
 
         self._enc: Encoder | None = encoder
 
-        # have we closed this ringbuf?
+        # have we closed this mem-chan?
         # set to `False` on `.open()`
         self._is_closed: bool = True
 
@@ -437,7 +331,7 @@ class RingBufferSendChannel(trio.abc.SendChannel[PayloadT]):
             self._is_closed = False
 
         except Exception as e:
-            e.add_note(f'while opening sender for {self._token.as_msg()}')
+            e.add_note(f'while opening sender for {self._token.to_dict()}')
             raise e
 
     def _close(self):
@@ -464,23 +358,23 @@ class RingBufferSendChannel(trio.abc.SendChannel[PayloadT]):
         return self
 
 
-class RingBufferReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
+class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
     '''
-    Ring Buffer receiver side implementation
+    Memory channel receiver side implementation
 
-    Do not use directly! manage with `attach_to_ringbuf_receiver`
-    after having opened a ringbuf context with `open_ringbuf`.
+    Do not use directly! manage with `attach_to_memory_receiver`
+    after having opened a mem-chan context with `open_memory_channel`.
 
     '''
     def __init__(
         self,
-        token: RBToken,
-        cleanup: bool = True,
+        token: MCToken,
+        cleanup: bool = False,
         decoder: Decoder | None = None
     ):
-        self._token = RBToken.from_msg(token)
+        self._token = MCToken.from_msg(token)
 
-        # ringbuf os resources
+        # mem-chan os resources
         self._shm: SharedMemory | None = None
         self._write_event = EventFD(self._token.write_eventfd, 'w')
         self._wrap_event = EventFD(self._token.wrap_eventfd, 'r')
@@ -499,7 +393,7 @@ class RingBufferReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
         # close shm & fds on exit?
         self._cleanup: bool = cleanup
 
-        # have we closed this ringbuf?
+        # have we closed this mem-chan?
         # set to `False` on `.open()`
         self._is_closed: bool = True
 
@@ -547,7 +441,7 @@ class RingBufferReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
     async def _eof_monitor_task(self):
         '''
         Long running EOF event monitor, automatically run in bg by
-        `attach_to_ringbuf_receiver` context manager, if EOF event
+        `attach_to_memory_receiver` context manager, if EOF event
         is set its value will be the end pointer (highest valid
         index to be read from buf, after setting the `self._end_ptr`
         we close the write event which should cancel any blocked
@@ -748,7 +642,7 @@ class RingBufferReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
             self._is_closed = False
 
         except Exception as e:
-            e.add_note(f'while opening receiver for {self._token.as_msg()}')
+            e.add_note(f'while opening receiver for {self._token.to_dict()}')
             raise e
 
     def close(self):
@@ -772,22 +666,38 @@ class RingBufferReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
 
 @acm
-async def attach_to_ringbuf_receiver(
+async def attach_to_memory_receiver(
 
-    token: RBToken,
-    cleanup: bool = True,
+    token: MCToken | dict,
+    *,
+    cleanup: bool = False,
     decoder: Decoder | None = None,
 
-) -> AsyncGenerator[RingBufferReceiveChannel]:
+) -> AsyncGenerator[MemoryReceiveChannel, None]:
     '''
-    Attach a RingBufferReceiveChannel from a previously opened
-    RBToken.
+    Attach a `MemoryReceiveChannel` from a previously opened
+    MCToken.
 
     Launches `receiver._eof_monitor_task` in a `trio.Nursery`.
+
     '''
+    token = MCToken.from_msg(token)
+
+    if token.share_path:
+        write, wrap, eof = await recv_fds(token.share_path, 3)
+        token = MCToken(
+            shm_name=token.shm_name,
+            write_eventfd=write,
+            wrap_eventfd=wrap,
+            eof_eventfd=eof,
+            buf_size=token.buf_size,
+            share_path=token.share_path
+        )
+        log.info(f'received fds from {token.share_path}')
+
     async with (
         trio.open_nursery(strict_exception_groups=False) as n,
-        RingBufferReceiveChannel(
+        MemoryReceiveChannel(
             token,
             cleanup=cleanup,
             decoder=decoder
@@ -798,21 +708,35 @@ async def attach_to_ringbuf_receiver(
 
 
 @acm
-async def attach_to_ringbuf_sender(
+async def attach_to_memory_sender(
 
-    token: RBToken,
+    token: MCToken | dict,
+    *,
     batch_size: int = 1,
-    cleanup: bool = True,
+    cleanup: bool = False,
     encoder: Encoder | None = None,
 
-) -> AsyncGenerator[RingBufferSendChannel]:
+) -> AsyncGenerator[MemorySendChannel, None]:
     '''
-    Attach a RingBufferSendChannel from a previously opened
-    RBToken.
+    Attach a `MemorySendChannel` from a previously opened
+    MCToken.
 
     '''
+    token = MCToken.from_msg(token)
 
-    async with RingBufferSendChannel(
+    if token.share_path:
+        write, wrap, eof = await recv_fds(token.share_path, 3)
+        token = MCToken(
+            shm_name=token.shm_name,
+            write_eventfd=write,
+            wrap_eventfd=wrap,
+            eof_eventfd=eof,
+            buf_size=token.buf_size,
+            share_path=token.share_path
+        )
+        log.info(f'received fds from {token.share_path}')
+
+    async with MemorySendChannel(
         token,
         batch_size=batch_size,
         cleanup=cleanup,
@@ -821,16 +745,16 @@ async def attach_to_ringbuf_sender(
         yield sender
 
 
-class RingBufferChannel(trio.abc.Channel[bytes]):
+class MemoryChannel(trio.abc.Channel[bytes]):
     '''
-    Combine `RingBufferSendChannel` and `RingBufferReceiveChannel`
+    Combine `MemorySendChannel` and `MemoryReceiveChannel`
     in order to expose the bidirectional `trio.abc.Channel` API.
 
     '''
     def __init__(
         self,
-        sender: RingBufferSendChannel,
-        receiver: RingBufferReceiveChannel
+        sender: MemorySendChannel,
+        receiver: MemoryReceiveChannel
     ):
         self._sender = sender
         self._receiver = receiver
@@ -862,9 +786,6 @@ class RingBufferChannel(trio.abc.Channel[bytes]):
     async def send(self, value: bytes) -> None:
         await self._sender.send(value)
 
-    async def send_eof(self) -> None:
-        await self._sender.send_eof()
-
     def receive_nowait(self, max_bytes: int = _DEFAULT_RB_SIZE) -> bytes:
         return self._receiver.receive_nowait(max_bytes=max_bytes)
 
@@ -883,30 +804,31 @@ class RingBufferChannel(trio.abc.Channel[bytes]):
 
 
 @acm
-async def attach_to_ringbuf_channel(
-    token_in: RBToken,
-    token_out: RBToken,
+async def attach_to_memory_channel(
+    token_in: MCToken | dict,
+    token_out: MCToken | dict,
+    *,
     batch_size: int = 1,
-    cleanup_in: bool = True,
-    cleanup_out: bool = True,
+    cleanup_in: bool = False,
+    cleanup_out: bool = False,
     encoder: Encoder | None = None,
     decoder: Decoder | None = None,
-) -> AsyncGenerator[RingBufferChannel]:
+) -> AsyncGenerator[MemoryChannel]:
     '''
-    Attach to two previously opened `RBToken`s and return a `RingBufferChannel`
+    Attach to two previously opened `MCToken`s and return a `MemoryChannel`
 
     '''
     async with (
-        attach_to_ringbuf_receiver(
+        attach_to_memory_receiver(
             token_in,
             cleanup=cleanup_in,
             decoder=decoder,
         ) as receiver,
-        attach_to_ringbuf_sender(
+        attach_to_memory_sender(
             token_out,
             batch_size=batch_size,
             cleanup=cleanup_out,
             encoder=encoder,
         ) as sender,
     ):
-        yield RingBufferChannel(sender, receiver)
+        yield MemoryChannel(sender, receiver)

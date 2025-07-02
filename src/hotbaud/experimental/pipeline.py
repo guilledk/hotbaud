@@ -1,29 +1,63 @@
+# The MIT License (MIT)
+# 
+# Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+'''
+A *Unix* style "pipe/pipeline" of callables, optional fan in/out to multi
+processes.
+
+Meant for:
+
+    - Simple "throw away pipelines"
+    - Testing
+    - Simple benchmarks
+
+'''
+
 from __future__ import annotations
 
-import enum
-from functools import partial
-import itertools
-import logging
-from dataclasses import dataclass
 import os
+import enum
+import logging
+
+from typing import Any, Awaitable, Callable, Generator, Protocol, Sequence
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Generator, Sequence
+from functools import partial
+from dataclasses import dataclass
 
 import trio
 from trio.socket import SocketType
-from hotbaud import run_in_worker
+
+from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
     MCToken,
     alloc_memory_channel,
 )
-from hotbaud.types import SharedMemory
+
 from hotbaud._utils import make_partial
 from hotbaud._fdshare import open_fd_share_socket
 
+from hotbaud.experimental._worker import run_in_worker
+
+
 log = logging.getLogger(__name__)
-
-
-#  Enums / data‑classes
 
 
 class ConnectionStrategy(enum.StrEnum):
@@ -32,26 +66,26 @@ class ConnectionStrategy(enum.StrEnum):
 
     '''
 
-    STRICT = 'strict'
-    FAN_OUT = 'fan_out'
-    FAN_IN = 'fan_in'
+    ONE_TO_ONE = 'one_to_one'
+    ONE_TO_MANY = 'one_to_many'
+    MANY_TO_ONE = 'many_to_one'
 
     def validate(self, up_size: int, down_size: int) -> None:
         match self:
-            case ConnectionStrategy.STRICT:
+            case ConnectionStrategy.ONE_TO_ONE:
                 if up_size != down_size:
                     raise ValueError(
-                        f'STRICT expects equal worker counts (up={up_size}, down={down_size})'
+                        f'ONE_TO_ONE expects equal worker counts (up={up_size}, down={down_size})'
                     )
-            case ConnectionStrategy.FAN_OUT:
+            case ConnectionStrategy.ONE_TO_MANY:
                 if up_size != 1 or down_size < 2:
                     raise ValueError(
-                        'FAN_OUT requires 1 upstream worker and ≥2 downstream workers'
+                        'ONE_TO_MANY requires 1 upstream worker and ≥2 downstream workers'
                     )
-            case ConnectionStrategy.FAN_IN:
+            case ConnectionStrategy.MANY_TO_ONE:
                 if up_size < 2 or down_size != 1:
                     raise ValueError(
-                        'FAN_IN requires ≥2 upstream workers and exactly 1 downstream worker'
+                        'MANY_TO_ONE requires ≥2 upstream workers and exactly 1 downstream worker'
                     )
 
 
@@ -65,13 +99,16 @@ class StageDef:
     id: str
     func: partial
     size: int = 1
+    asyncio: bool = False
 
     # channel aliases scoped to this stage
     inputs: Sequence[str] = ()
+    in_size: int = 64 * 1024
     outputs: Sequence[str] = ()
+    out_size: int = 64 * 1024
 
-    # how to connect *from this* stage *to the next* (default STRICT)
-    strategy: ConnectionStrategy = ConnectionStrategy.STRICT
+    # how to connect *from this* stage *to the next* (default ONE_TO_ONE)
+    strategy: ConnectionStrategy = ConnectionStrategy.ONE_TO_ONE
 
     def iter_worker_ids(self) -> Generator[str, None, None]:
         return (f'{self.id}[{i}]' for i in range(self.size))
@@ -80,7 +117,7 @@ class StageDef:
 @dataclass(slots=True)
 class ChannelDef:
     '''
-    Metadata about one logical ring‑buffer channel.
+    Metadata about one logical IPC memory channel.
 
     '''
 
@@ -92,7 +129,9 @@ class ChannelDef:
 
     async def fdshare_task(self) -> None:
         if self.share_sock is None:
-            raise RuntimeError('Started fdshare_task on a None self.share_sock ?')
+            raise RuntimeError(
+                'Started fdshare_task on a None self.share_sock ?'
+            )
 
         if self.token is None:
             raise RuntimeError('Started fdshare_task on a None self.token ?')
@@ -121,9 +160,12 @@ class PipelineBuilder:
         func: partial | Callable | Awaitable,
         *,
         inputs: str | Sequence[str] | None = None,
+        in_size: int = 64 * 1024,
         outputs: str | Sequence[str] | None = None,
+        out_size: int = 64 * 1024,
+        asyncio: bool = False,
         size: int = 1,
-        strategy: ConnectionStrategy | str = ConnectionStrategy.STRICT,
+        strategy: ConnectionStrategy | str = ConnectionStrategy.ONE_TO_ONE,
     ) -> PipelineBuilder:
         '''
         Add a *stage* (worker pool) to the pipeline.
@@ -149,57 +191,89 @@ class PipelineBuilder:
             inputs=(inputs,)
             if isinstance(inputs, str)
             else tuple(inputs or ()),
+            in_size=in_size,
             outputs=(outputs,)
             if isinstance(outputs, str)
             else tuple(outputs or ()),
+            out_size=out_size,
+            asyncio=asyncio,
             strategy=strat,
         )
         self._stages.append(sdef)
 
-        for ch in itertools.chain(sdef.inputs, sdef.outputs):
-            self._channels.setdefault(ch, ChannelDef(
-                name=ch,
-            ))
+        for ch in sdef.inputs:
+            self._channels.setdefault(ch, ChannelDef(name=ch, buf_size=in_size))
+
+        for ch in sdef.outputs:
+            self._channels.setdefault(
+                ch, ChannelDef(name=ch, buf_size=out_size)
+            )
 
         return self
 
-    def fan_out(
+    def one_to_many(
         self,
         sid: str,
         func: partial,
         *,
         input: str | None = None,
+        in_size: int = 64 * 1024,
         outputs: str | Sequence[str] | None = None,
+        out_size: int = 64 * 1024,
+        asyncio: bool = False,
         size: int = 1,
     ) -> PipelineBuilder:
+        '''
+        Syntax sugar for a .stage() call with `ONE_TO_MANY` strategy
+
+        '''
         return self.stage(
             sid,
             func,
             inputs=[input] if input else None,
+            in_size=in_size,
             outputs=outputs,
+            out_size=out_size,
+            asyncio=asyncio,
             size=size,
-            strategy=ConnectionStrategy.FAN_OUT,
+            strategy=ConnectionStrategy.ONE_TO_MANY,
         )
 
-    def fan_in(
+    def many_to_one(
         self,
         sid: str,
         func: partial,
         *,
         inputs: str | Sequence[str] | None = None,
+        in_size: int = 64 * 1024,
         output: str | None = None,
+        out_size: int = 64 * 1024,
+        asyncio: bool = False,
         size: int = 1,
     ) -> PipelineBuilder:
+        '''
+        Syntax sugar for a .stage() call with `MANY_TO_ONE` strategy
+
+        '''
         return self.stage(
             sid,
             func,
             inputs=inputs,
+            in_size=in_size,
             outputs=[output] if output else None,
+            out_size=out_size,
+            asyncio=asyncio,
             size=size,
-            strategy=ConnectionStrategy.FAN_IN,
+            strategy=ConnectionStrategy.MANY_TO_ONE,
         )
 
     def _auto_expand_channels(self) -> None:
+        '''
+        Convert a single string name into multiple channel definitions made out of
+        the prefix + the worker index depending on the topology of the pipeline.
+
+        '''
+
         def _dup(prefix: str, n: int) -> tuple[str, ...]:
             return tuple(f'{prefix}{i}' for i in range(n))
 
@@ -209,23 +283,23 @@ class PipelineBuilder:
             prev = self._stages[idx - 1] if idx else None
             nxt = self._stages[idx + 1] if idx + 1 < len(self._stages) else None
 
-            # -------- figure inputs --------
+            # figure inputs
             inps: tuple[str, ...] = s.inputs
             if len(inps) == 1 and isinstance(inps[0], str):
                 need = (
                     s.size
-                    if prev and prev.strategy is ConnectionStrategy.FAN_OUT
+                    if prev and prev.strategy is ConnectionStrategy.ONE_TO_MANY
                     else (prev.size if prev else s.size)
                 )
                 if need > 1:
                     inps = _dup(inps[0], need)
 
-            # -------- figure outputs --------
+            # figure outputs
             outs: tuple[str, ...] = s.outputs
             if len(outs) == 1 and isinstance(outs[0], str):
                 need = (
                     nxt.size
-                    if s.strategy is ConnectionStrategy.FAN_OUT and nxt
+                    if s.strategy is ConnectionStrategy.ONE_TO_MANY and nxt
                     else s.size
                 )
                 if need > 1:
@@ -238,7 +312,10 @@ class PipelineBuilder:
                     func=s.func,
                     size=s.size,
                     inputs=inps,
+                    in_size=s.in_size,
                     outputs=outs,
+                    out_size=s.out_size,
+                    asyncio=s.asyncio,
                     strategy=s.strategy,
                 )
             )
@@ -249,17 +326,26 @@ class PipelineBuilder:
         # rebuild the channel registry
         self._channels.clear()
         for st in self._stages:
-            for ch in (*st.inputs, *st.outputs):
-                self._channels.setdefault(ch, ChannelDef(name=ch))
+            for ch in st.inputs:
+                self._channels.setdefault(
+                    ch, ChannelDef(name=ch, buf_size=st.in_size)
+                )
+            for ch in st.outputs:
+                self._channels.setdefault(
+                    ch, ChannelDef(name=ch, buf_size=st.out_size)
+                )
 
     def _validate_topology(self) -> None:
-        '''Ensure declared stage sizes & strategies fit together.'''
+        '''
+        Ensure declared stage sizes & strategies fit together.
+
+        '''
         pairs = zip(self._stages, self._stages[1:])
         for upstream, downstream in pairs:
-            # Special-case: many STRICT workers feeding a single FAN_IN sink
+            # special-case: many ONE_TO_ONE workers feeding a single MANY_TO_ONE sink
             if (
-                upstream.strategy is ConnectionStrategy.STRICT
-                and downstream.strategy is ConnectionStrategy.FAN_IN
+                upstream.strategy is ConnectionStrategy.ONE_TO_ONE
+                and downstream.strategy is ConnectionStrategy.MANY_TO_ONE
                 and downstream.size == 1
             ):
                 continue
@@ -268,16 +354,20 @@ class PipelineBuilder:
             # we could extend validation here (channel compatibility etc.)
 
     async def _alloc_channels(self) -> None:
+        '''
+        Allocate all the resources needed for the pipeline
+
+        '''
         for cdef in self._channels.values():
             key = f'{self.pipe_id}.{cdef.name}'
             (
                 cdef.shm,
                 cdef.token,
-                cdef.share_sock
+                cdef.share_sock,
             ) = await alloc_memory_channel(
                 key,
                 buf_size=cdef.buf_size,
-                share_path=str(self._socket_dir / f'{key}.sock')
+                share_path=str(self._socket_dir / f'{key}.sock'),
             )
 
     async def build(self) -> 'Pipeline':
@@ -296,9 +386,9 @@ class PipelineBuilder:
         workers: list[PipelineWorker] = []
 
         for sdef in self._stages:
-            # Prepare one fully-resolved *callable* per worker instance so that
-            # positional/keyword manipulation below does not bleed across
-            # workers.
+            # inject, depending on topology, the input and/or output token or
+            # tokens into the function's `in_token(s)` & `out_token(s)` keyword
+            # arguments
             for idx in range(sdef.size):
                 func = partial(sdef.func)  # fresh copy
                 kw: dict[str, Any] = {}
@@ -306,52 +396,52 @@ class PipelineBuilder:
                 # input side
                 if sdef.inputs:
                     in_toks = [self._channels[ch].token for ch in sdef.inputs]
-                    if sdef.strategy is ConnectionStrategy.FAN_IN:
+                    if sdef.strategy is ConnectionStrategy.MANY_TO_ONE:
                         kw['in_tokens'] = in_toks  # N -> 1
                     elif (
-                        sdef.strategy is ConnectionStrategy.STRICT
+                        sdef.strategy is ConnectionStrategy.ONE_TO_ONE
                         and len(in_toks) >= sdef.size
                     ):
-                        kw['in_token'] = in_toks[idx]  # 1 <-> 1
+                        kw['in_token'] = in_toks[idx]  # 1 -> 1
                     else:
                         kw['in_token'] = in_toks[0]  # single input
 
                 # output side
                 if sdef.outputs:
                     out_toks = [self._channels[ch].token for ch in sdef.outputs]
-                    if sdef.strategy is ConnectionStrategy.FAN_OUT:
+                    if sdef.strategy is ConnectionStrategy.ONE_TO_MANY:
                         kw['out_tokens'] = out_toks  # 1 -> N
                     elif (
-                        sdef.strategy is ConnectionStrategy.STRICT
+                        sdef.strategy is ConnectionStrategy.ONE_TO_ONE
                         and len(out_toks) >= sdef.size
                     ):
-                        kw['out_token'] = out_toks[idx]  # 1 <-> 1
+                        kw['out_token'] = out_toks[idx]  # 1 -> 1
                     else:
                         kw['out_token'] = out_toks[0]  # single output
 
                 func.keywords.update(kw)
 
                 wid = f'{sdef.id}[{idx}]'
-                workers.append(PipelineWorker(id=wid, func=func))
+                workers.append(PipelineWorker(id=wid, func=func, stage=sdef))
 
         return Pipeline(self.pipe_id, self._stages, workers, self._channels)
 
 
-#  Runtime pieces - very small; heavy lifting is done in builder helpers
+class WorkerSpawnFn(Protocol):
+    def __call__(
+        self,
+        worker_id: str,
+        task: partial,
+        *,
+        asyncio: bool,
+    ) -> Awaitable[Any]: ...
 
 
 @dataclass(slots=True)
 class PipelineWorker:
     id: str
     func: partial
-
-    async def run(self) -> None:
-        await run_in_worker(
-            self.id,
-            self.func,
-            asyncio=False,
-            # worker_type='fork',
-        )
+    stage: StageDef
 
 
 class Pipeline:
@@ -372,20 +462,27 @@ class Pipeline:
         self.workers = workers
         self.channels = channels
 
-    def token(self, ch_name: str) -> MCToken:
-        '''Expose the *MCToken* for a given channel name.'''
-        return self.channels[ch_name].token  # type: ignore[return-value]
+    async def run(self, *, spawn_fn: WorkerSpawnFn = run_in_worker) -> None:
+        '''
+        Long running pipeline task.
 
-    async def run(self) -> None:
-        '''Spawn all workers, plus an optional path‑publisher.'''
+        Start all fdshare tasks for channels that need it, then spawn all long
+        running worker tasks
+
+        '''
         async with trio.open_nursery() as nursery:
+            # channels with .token.share_path need a task spawned to open the
+            # socket and pass the fds to clients
             for c in self.channels.values():
                 assert c.token, 'Expected {c.name} to have token at this point'
                 if c.token.share_path:
                     nursery.start_soon(c.fdshare_task)
 
+            # spawn all workers
             for w in self.workers:
-                nursery.start_soon(w.run)
+                nursery.start_soon(
+                    partial(spawn_fn, w.id, w.func, asyncio=w.stage.asyncio)
+                )
 
             log.info(
                 'pipeline %s started with %d workers across %d stages',
@@ -393,8 +490,6 @@ class Pipeline:
                 len(self.workers),
                 len(self.stages),
             )
-
-    #  Async context manager - clean up SHM
 
     async def __aenter__(self):
         return self

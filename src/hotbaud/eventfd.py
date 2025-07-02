@@ -1,9 +1,31 @@
+# The MIT License (MIT)
+# 
+# Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 '''
 Expose libc eventfd APIs
 
 '''
 import os
 import errno
+from typing import Literal
 
 import cffi
 import trio
@@ -93,6 +115,9 @@ def close_eventfd(fd: int) -> int:
         raise OSError(errno.errorcode[ffi.errno], 'close failed')
 
 
+EFDSyncMethods = Literal['epoll', 'thread']
+
+
 class EFDReadCancelled(Exception):
     ...
 
@@ -108,7 +133,8 @@ class EventFD:
     def __init__(
         self,
         fd: int,
-        omode: str
+        omode: str,
+        sync_backend: EFDSyncMethods = 'epoll'
     ):
         self._fd: int = fd
         self._omode: str = omode
@@ -116,6 +142,7 @@ class EventFD:
         self._cscope: trio.CancelScope | None = None
         self._is_closed: bool = True
         self._read_lock = trio.StrictFIFOLock()
+        self.sync_backend = sync_backend
 
     @property
     def closed(self) -> bool:
@@ -150,14 +177,16 @@ class EventFD:
             self._cscope = trio.CancelScope()
             with self._cscope:
                 try:
-                    await trio.lowlevel.wait_readable(self._fd)
-                    value = self.read_nowait()
+                    match self.sync_backend:
+                        case 'epoll':
+                            await trio.lowlevel.wait_readable(self._fd)
+                            value = self.read_nowait()
 
-                    # old thread based read:
-                    # return await trio.to_thread.run_sync(
-                    #     read_eventfd, self._fd,
-                    #     abandon_on_cancel=True
-                    # )
+                        case 'thread':
+                            return await trio.to_thread.run_sync(
+                                read_eventfd, self._fd,
+                                abandon_on_cancel=True
+                            )
 
                 except OSError as e:
                     if e.errno != errno.EBADF:

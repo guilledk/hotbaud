@@ -1,14 +1,44 @@
+# The MIT License (MIT)
+# 
+# Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+'''
+MemoryChannel One-to-Many / Many-to-One helpers
+
+(WIP)
+
+'''
 from __future__ import annotations
 
 import itertools
+
 from heapq import heappush, heappop
 from typing import AsyncIterator, Sequence
 
-import msgspec
 import trio
+import msgspec
 
 from msgspec import Raw
+
 from hotbaud._utils import MessageStruct
+
 from ._impl import (
     MCToken,
     attach_to_memory_sender,
@@ -49,14 +79,14 @@ class FanOutSender:
             attach_to_memory_sender(tok, batch_size=self.batch_size)
             for tok in self.out_tokens
         ]
-        # Lazily enter the child contexts (order preserved)
+        # lazily enter the child contexts (order preserved)
         # keep references for __aexit__
         self._sender_cmgrs = cmgrs
         self._senders = [await cm.__aenter__() for cm in cmgrs]
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        # Flush + close all children *in reverse order* to mirror stack unwinding
+        # flush + close all children *in reverse order* to mirror stack unwinding
         for cm in self._sender_cmgrs[::-1]:
             await cm.__aexit__(exc_type, exc, tb)
 

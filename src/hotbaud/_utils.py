@@ -1,8 +1,33 @@
+# The MIT License (MIT)
+# 
+# Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+'''
+Misc utils that don't deserve their own module (yet)
+
+'''
 import inspect
-import importlib
-from functools import partial
+
 from types import ModuleType
-from typing import Callable, Self
+from typing import Any, Self
+from functools import partial
 
 import msgspec
 
@@ -10,6 +35,10 @@ from hotbaud.types import Buffer
 
 
 class MessageStruct(msgspec.Struct, frozen=True):
+    '''
+    Base msgspec struct with some common conversion helpers
+
+    '''
     @classmethod
     def from_msg(cls, msg: dict | Self) -> Self:
         if isinstance(msg, cls):
@@ -35,10 +64,21 @@ class MessageStruct(msgspec.Struct, frozen=True):
         return msgspec.to_builtins(self)
 
 
-class InternalError(Exception): ...
-
-
 def disable_resource_tracker():
+    '''
+    When using resources like `SharedMemory` from std mp lib a
+    "resource tracker" system is ran in the bg, and reports lots of false
+    resource leaks, specially on structured concurrent envoirments where the
+    resource lifecycles are guaranteed to be handled automatically by the use
+    of context managers and try..finally clauses.
+
+    This is a function that disables the resource tracker by monkey pathing it
+    with a dummy class that does nothing.
+
+    On 3.13 the new `track` keyword argument was added to `SharedMemory` which
+    provides a way to opt out of the resource tracker system.
+
+    '''
     from multiprocessing import resource_tracker
 
     class DummyTracker(resource_tracker.ResourceTracker):
@@ -74,126 +114,101 @@ def make_partial(fn, /, *args, **kwargs):
     return partial(fn, *args, **kwargs)
 
 
-class ResolveError(RuntimeError):
+def namespace_for(obj: Any) -> str:
     '''
-    Could not resolve the given namespace string into a callable.
+    Given an object like a module or function, return a "namespace" string
+    compatible with stdlib's `pkgutil.resolve_name`:
 
-    '''
+    > It is expected that name will be a string in one of the following formats,
+    where W is shorthand for a valid Python identifier and dot stands for a
+    literal period in these pseudo-regexes:
 
+    > W(.W)*
 
-def resolve_callable(path: str) -> Callable[..., object]:
-    '''
-    Return the callable referred to by *path*.
+    > W(.W)*:(W(.W)*)?
 
-    The syntax is either
+    > The first form is intended for backward compatibility only. It assumes
+    that some part of the dotted name is a package, and the rest is an object
+    somewhere within that package, possibly nested inside other objects.
+    Because the place where the package stops and the object hierarchy starts
+    can’t be inferred by inspection, repeated attempts to import must be done
+    with this form.
 
-        "pkg.module:attr.subattr"
-        "pkg.module.attr.subattr"
+    > In the second form, the caller makes the division point clear through
+    the provision of a single colon: the dotted name to the left of the colon
+    is a package to be imported, and the dotted name to the right is the object
+    hierarchy within that package. Only one import is needed in this form. If
+    it ends with the colon, then a module object is returned.
 
-    where everything **left of the first ":" (if present)** or the
-    **last “.”** is treated as the importable module, and the remainder
-    is traversed with successive ``getattr`` calls.
+    (from: https://docs.python.org/3/library/pkgutil.html)
 
-    Raises
-    ------
-    ResolveError
-        If the module cannot be imported, an attribute is missing, or the
-        final object is not callable.
+    Considerations:
 
-    '''
-    if ':' in path:
-        module_path, attr_path = path.split(':', 1)
-    else:
-        module_path, attr_path = path.rsplit('.', 1)
+    # Module-level callables are safe:
+    Functions, classes, and module attributes that live directly in an
+    importable module work fine (this is the main use case).
 
-    # 1. import the root module
-    try:
-        module: ModuleType = importlib.import_module(module_path)
-    except Exception as exc:  # pragma: no cover
-        raise ResolveError(f"Cannot import module '{module_path}'") from exc
+    # Bound methods are not importable
+    Passing instance.method gives you a method object whose attribute path is
+    no longer addressable (Path.home lives in the class, but Path().home does
+    not).
 
-    # 2. walk the attribute chain
-    obj: object = module
-    for segment in attr_path.split('.'):
-        try:
-            obj = getattr(obj, segment)
-        except AttributeError as exc:  # pragma: no cover
-            raise ResolveError(
-                f"Module '{module_path}' has no attribute chain "
-                f"'{attr_path}' (failed at '{segment}')"
-            ) from exc
+    >>> namespace_for(Path.home)  # OK
+    'pathlib:Path.home'
+    >>> namespace_for(Path().home)  # ValueError (not addressable)
 
-    # 3. make sure we ended with something callable
-    if not callable(obj):
-        raise ResolveError(
-            f"Resolved object '{module_path}:{attr_path}' is not callable"
-        )
+    # Nested / local / lambda functions break the round-trip
+    Their __qualname__ contains <locals> and there is no corresponding attribute
+    chain in the module. The resulting string will fail when you feed it to
+    resolve_name.
 
-    return obj
+    # Objects defined in __main__ or interactive sessions
+    inspect.getmodule(obj) returns __main__; that module can't be re-imported,
+    so the string is useless outside the current interpreter.
 
+    # Decorators that hide the wrapped object
+    If a decorator does not copy __module__ and __qualname__ with
+    functools.wraps, the helper will produce a path for the wrapper, not the
+    original function.
 
-class PathError(RuntimeError):
-    '''
-    The given object cannot be expressed as an importable namespace path.
+    # Dynamically generated functions
+    Anything created with types.FunctionType, eval, or exec may have the right
+    __module__, but unless you also assign it into that module's namespace the
+    attribute lookup will fail.
 
-    '''
+    # staticmethod / classmethod
+    These descriptor objects themselves are not importable, but their
+    underlying function is. Always pass MyCls.method.__func__ (or MyCls.method
+    before attribute access turns it into a function/method).
 
+    # Coroutine and generator objects
+    The function that returns them is fine; the object you get after calling
+    the function (async def f(): ...; f() or def g(): yield) is not importable.
 
-def _root_object(obj: Callable) -> Callable:
-    '''
-    Peel away functools.wraps / decorators so we record the *real* function.
+    # functools.partial, operator.methodcaller, other wrappers
+    They are plain instances with __call__; no module/qualname path exists.
 
-    '''
-    return inspect.unwrap(obj)
+    # Callable instances of user classes
+    A class that implements __call__ (e.g. a functor) resolves to that instance,
+    not to a named attribute in the module.
 
+    # Built-ins and C-implemented functions
+    Most live in the builtins or math, itertools, ... modules and work
+    (builtins:int, itertools:chain). A few low-level callables (e.g. some
+    CPython internals) do not expose __qualname__ and therefore fail.
 
-def namespace_for(obj: Callable, *, use_colon: bool = True) -> str:
-    '''
-    Return an import-path string for *obj* that round-trips with
-    ``resolve_callable`` -> ``namespace_for``.
-
-    Examples
-    --------
-    >>> namespace_for(math.sqrt)
-    'math:sqrt'
-    >>> namespace_for(PathLike.__fspath__)  # a classmethod
-    'os:pathlib.PathLike.__fspath__'
-
-    Notes & Caveats
-    ---------------
-    * The function **must** be defined at module scope (or as a method of such
-      a class).  Nested/closure functions do *not* have a stable import path.
-    * Objects defined in ``__main__`` cannot be resolved after a fork/exec.
-    * Decorated callables are unwrapped first so you get the real origin.
+    # Objects removed or renamed after you serialize the path
+    The round-trip only works as long as the module’s public surface remains
+    unchanged.
 
     '''
-    obj = _root_object(obj)
+    if isinstance(obj, ModuleType):
+        return obj.__name__  # e.g. 'pathlib'
 
-    # 1. We need a reliable module.
-    mod_name = getattr(obj, '__module__', None)
-    if not mod_name or mod_name == '__main__':
-        raise PathError('Object sits in __main__; no import path exists')
+    mod = inspect.getmodule(obj)
+    if mod is None:  # built-ins, C-impl, etc.
+        raise ValueError('object is not tied to an importable module')
 
-    qual = getattr(obj, '__qualname__', None)
-    if not qual:
-        raise PathError('Object lacks __qualname__')
+    qual = getattr(obj, '__qualname__', obj.__name__)
 
-    # 2. Validate that the final hop really is reachable via getattr-chains.
-    here = importlib.import_module(mod_name)
-    for segment in qual.split('.'):
-        try:
-            here = getattr(here, segment)
-        except AttributeError as exc:  # pragma: no cover
-            raise PathError(
-                f"{mod_name}:{qual} cannot be resolved (failed at '{segment}')"
-            ) from exc
-
-    # 3. Ensure round-trip identity (useful with decorators).
-    if _root_object(here) is not obj:
-        raise PathError(
-            f'Round-trip mismatch for {obj!r} - '
-            f'got {_root_object(here)!r} instead'
-        )
-
-    sep = ':' if use_colon else '.'
-    return f'{mod_name}{sep}{qual}'
+    return f'{mod.__name__}:{qual}'  # e.g. 'pathlib:Path.home'

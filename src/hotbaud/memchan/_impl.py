@@ -1,11 +1,113 @@
+# The MIT License (MIT)
+# 
+# Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the “Software”), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 '''
 IPC MemoryChannel implementation
 
+Trying to follow trio semantics as close as posible.
+
+(Linux only atm)
+
+There are two main components:
+
+- `multiprocessing.shared_memory.SharedMemory`
+- `hotbaud.EventFD`
+
+Which in reality just are wrappers to `mmap(2)` (posix/sysV/BSD) and
+`eventfd(2)` (linux).
+
+###
+
+TODO: generalize overrun semantics & make it configurable:
+
+    - hotbaud.Event() to abstract `eventfd(2)`, `kqueue(2)` & `EventObjects`
+
+    - abstract the MemoryChannel more to allow for different models of shared
+    mem access syncronization, using the different primitives / algos (imagine
+    the benchmarks!)
+
+    - wizard level tech, User-space Interrupts:
+
+    > There is a ~9x or higher performance improvement using User IPI over other
+      IPC mechanisms for event signaling.
+
+    > https://lwn.net/ml/linux-kernel/20210913200132.3396598-1-sohil.mehta@intel.com/
+
+###
+
+# Allocation:
+
+We allocate a shared memory segment of a specific size using the
+`alloc_memory_channel` function, as well as, three `eventfd(2)` used for
+signaling. This returns an `MCToken` which contains all the necesary info to
+connect to a channel.
+
+The `eventfd(2)`s are all initialized to value 0, and non blocking mode.
+
+# Writer side:
+
+On a separate process or thread we can open the memory channel by using the
+`attach_to_memory_sender` context manager.
+
+Once opened the writer can start placing byte sequences on the shared memory
+segment, respecting the rule that after doing so it must do a write to the
+"writefd" event with the integer parameter being the length of the byte
+sequence written.
+
+Once the writer reaches the end of the buffer it will read from the `wrapfd`
+event, which the reader will use to signal reaching the end of the buffer,
+unblocking the writer which will begin the process all over again starting
+from first index on the shared memory segment.
+
+# Reader side:
+
+On a separate process or thread we can open the memory channel by using the
+`attach_to_memory_receiver` context manager.
+
+Once opened the reader will immediately read from the `writefd` event, which
+can only result in two outcomes:
+
+    - The event counter is 0 (meaning no bytes have been written to the shared
+    segment since last `writefd` read), which will make the kernel block
+    the thread until the counter gets incremented, returning the value,
+    reseting the kernel counter again and unblocking.
+
+    - The event counter was a positive integer, the call will immediately
+    return the counter value, signaling that we can read from last read index
+    until last read index + value. The kernel counter value will be reset to 0
+    after before read return.
+
+Once the reader reaches the end of the buffer, it will reset its read index
+back to 0 & write 1 to the `wrapfd`, which signals to the writer that we are
+ready to "wrap around" and start the process all over again, attempting a new
+read on the `writefd` event.
+
 '''
 from __future__ import annotations
+
 import os
+import sys
 import struct
 import logging
+
 from typing import (
     AsyncGenerator,
     TypeVar,
@@ -18,25 +120,30 @@ from multiprocessing.shared_memory import SharedMemory
 
 import trio
 from trio import socket
+
 from msgspec.msgpack import (
     Encoder,
     Decoder,
 )
 
 from hotbaud.types import Buffer
+from hotbaud.errors import HotbaudInternalError as InternalError
 from hotbaud.eventfd import (
     open_eventfd,
     EFDReadCancelled,
     EventFD
 )
-from hotbaud._utils import InternalError, MessageStruct, disable_resource_tracker
+from hotbaud._utils import MessageStruct
 from hotbaud._fdshare import maybe_open_fd_share_socket, recv_fds
+
+
+if sys.version_info.minor < 13:
+    from hotbaud._utils import disable_resource_tracker
+    disable_resource_tracker()
 
 
 log = logging.getLogger(__name__)
 
-
-disable_resource_tracker()
 
 _DEFAULT_RB_SIZE = 10 * 1024
 
@@ -75,10 +182,16 @@ async def alloc_memory_channel(
     Allocate OS resources for a memory channel.
 
     '''
+    extra_kwargs = {}
+
+    if sys.version_info.minor == 13:
+        extra_kwargs['track'] = False
+
     shm = SharedMemory(
         name=shm_name,
         size=buf_size,
-        create=True
+        create=True,
+        **extra_kwargs
     )
     token = MCToken(
         shm_name=shm_name,
@@ -320,10 +433,15 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
 
     def open(self):
         try:
+            extra_kwargs = {}
+            if sys.version_info.minor == 13:
+                extra_kwargs['track'] = False
+
             self._shm = SharedMemory(
                 name=self._token.shm_name,
                 size=self._token.buf_size,
-                create=False
+                create=False,
+                **extra_kwargs
             )
             self._write_event.open()
             self._wrap_event.open()
@@ -631,10 +749,15 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
     def open(self):
         try:
+            extra_kwargs = {}
+            if sys.version_info.minor == 13:
+                extra_kwargs['track'] = False
+
             self._shm = SharedMemory(
                 name=self._token.shm_name,
                 size=self._token.buf_size,
-                create=False
+                create=False,
+                **extra_kwargs
             )
             self._write_event.open()
             self._wrap_event.open()

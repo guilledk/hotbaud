@@ -45,6 +45,7 @@ from dataclasses import dataclass
 import trio
 from trio.socket import SocketType
 
+from hotbaud.eventfd import EFDSyncMethods, default_sync_method
 from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
     MCToken,
@@ -146,12 +147,19 @@ class PipelineBuilder:
 
     '''
 
-    def __init__(self, pipe_id: str):
+    def __init__(
+        self,
+        pipe_id: str,
+        *,
+        sync_backend: EFDSyncMethods = default_sync_method,
+        share_path: Path | str = Path('.hotbaud/share')
+    ):
         self.pipe_id = pipe_id
+        self._sync_backend: EFDSyncMethods = sync_backend
         self._stages: list[StageDef] = []
         self._channels: dict[str, ChannelDef] = {}
 
-        self._socket_dir = Path('.hotbaud/share') / str(os.getpid())
+        self._socket_dir = Path(share_path) / str(os.getpid())
         self._socket_dir.mkdir(parents=True)
 
     def stage(
@@ -368,6 +376,7 @@ class PipelineBuilder:
                 key,
                 buf_size=cdef.buf_size,
                 share_path=str(self._socket_dir / f'{key}.sock'),
+                sync_backend=self._sync_backend
             )
 
     async def build(self) -> 'Pipeline':
@@ -478,18 +487,26 @@ class Pipeline:
                 if c.token.share_path:
                     nursery.start_soon(c.fdshare_task)
 
-            # spawn all workers
-            for w in self.workers:
-                nursery.start_soon(
-                    partial(spawn_fn, w.id, w.func, asyncio=w.stage.asyncio)
+            # use an inner nursery in order to have separate task scopes for
+            # worker tasks & fd share tasks
+            async with trio.open_nursery() as worker_nursery:
+                # spawn all workers
+                for w in self.workers:
+                    worker_nursery.start_soon(
+                        partial(spawn_fn, w.id, w.func, asyncio=w.stage.asyncio)
+                    )
+
+                log.info(
+                    'pipeline %s started with %d workers across %d stages',
+                    self.pipe_id,
+                    len(self.workers),
+                    len(self.stages),
                 )
 
-            log.info(
-                'pipeline %s started with %d workers across %d stages',
-                self.pipe_id,
-                len(self.workers),
-                len(self.stages),
-            )
+                # trio will now block on this scope until all worker tasks return
+
+            # cancel fd share tasks
+            nursery.cancel_scope.cancel()
 
     async def __aenter__(self):
         return self

@@ -59,7 +59,7 @@ EFD_CLOEXEC = 0o2000000
 EFD_NONBLOCK = 0o4000
 
 
-def open_eventfd(initval: int = 0, flags: int = EFD_NONBLOCK) -> int:
+def open_eventfd(initval: int = 0, flags: int = 0) -> int:
     '''
     Open an eventfd with the given initial value and flags.
     Returns the file descriptor on success, otherwise raises OSError.
@@ -117,6 +117,8 @@ def close_eventfd(fd: int) -> int:
 
 EFDSyncMethods = Literal['epoll', 'thread']
 
+default_sync_method: EFDSyncMethods = 'epoll'
+
 
 class EFDReadCancelled(Exception):
     ...
@@ -134,7 +136,7 @@ class EventFD:
         self,
         fd: int,
         omode: str,
-        sync_backend: EFDSyncMethods = 'epoll'
+        sync_backend: EFDSyncMethods = default_sync_method
     ):
         self._fd: int = fd
         self._omode: str = omode

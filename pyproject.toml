@@ -32,6 +32,12 @@ include = ['src/hotbaud']
 requires = ['hatchling']
 build-backend = 'hatchling.build'
 
+[dependency-groups]
+dev = [
+    'pytest>=8.4.1',
+    'pytest-trio>=0.8.0',
+]
+
 [tool.ruff]
 line-length = 80
 exclude = [
@@ -59,3 +65,4 @@ docstring-quotes = 'single'
 addopts = [
   '--show-capture=no',
 ]
+trio_mode = true

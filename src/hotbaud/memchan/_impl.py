@@ -129,6 +129,9 @@ from msgspec.msgpack import (
 from hotbaud.types import Buffer
 from hotbaud.errors import HotbaudInternalError as InternalError
 from hotbaud.eventfd import (
+    EFD_NONBLOCK,
+    EFDSyncMethods,
+    default_sync_method,
     open_eventfd,
     EFDReadCancelled,
     EventFD
@@ -176,7 +179,8 @@ async def alloc_memory_channel(
     shm_name: str,
     *,
     buf_size: int = _DEFAULT_RB_SIZE,
-    share_path: str | None = None
+    share_path: str | None = None,
+    sync_backend: EFDSyncMethods = default_sync_method,
 ) -> tuple[SharedMemory, MCToken, socket.SocketType | None]:
     '''
     Allocate OS resources for a memory channel.
@@ -193,11 +197,16 @@ async def alloc_memory_channel(
         create=True,
         **extra_kwargs
     )
+
+    eventfd_flags = 0
+    if sync_backend == 'epoll':
+        eventfd_flags = EFD_NONBLOCK
+
     token = MCToken(
         shm_name=shm_name,
-        write_eventfd=open_eventfd(),
-        wrap_eventfd=open_eventfd(),
-        eof_eventfd=open_eventfd(),
+        write_eventfd=open_eventfd(flags=eventfd_flags),
+        wrap_eventfd=open_eventfd(flags=eventfd_flags),
+        eof_eventfd=open_eventfd(flags=eventfd_flags),
         buf_size=buf_size,
         share_path=share_path
     )
@@ -215,7 +224,8 @@ async def open_memory_channel(
     shm_name: str,
     *,
     buf_size: int = _DEFAULT_RB_SIZE,
-    share_path: str | None = None
+    share_path: str | None = None,
+    sync_backend: EFDSyncMethods = default_sync_method
 ) -> AsyncGenerator[MCToken]:
     '''
     Handle resources for a mem-chan (shm, eventfd, share_sock), yield `MCToken`
@@ -230,7 +240,8 @@ async def open_memory_channel(
         shm, token, sh_sock = await alloc_memory_channel(
             shm_name,
             buf_size=buf_size,
-            share_path=share_path
+            share_path=share_path,
+            sync_backend=sync_backend
         )
         async with maybe_open_fd_share_socket(sh_sock, token.fds):
             yield token

@@ -40,6 +40,7 @@ import os
 import inspect
 import pkgutil
 
+import sys
 from typing import Any, Self
 from functools import partial
 
@@ -147,21 +148,22 @@ async def run_in_worker(
 
     # spawn the child
     cmd = [
-        # alias for `worker_main` function (defined in pyproject.toml)
-        'hotbaud-worker',
+        sys.executable,
+        '-m',
+        'hotbaud.experimental._worker',
         worker_id,  # just so worker id is shown on process info
     ]
 
-    async with trio.open_nursery() as nursery:
-        process: trio.Process = await nursery.start(
-            partial(trio.run_process, cmd, env=env, **kwargs)
-        )
+    process: trio.Process = await trio.lowlevel.open_process(cmd, env=env, **kwargs)
 
-        # trio.run_process will propagate cancellation & errors
-        try:
-            await process.wait()
+    try:
+        await process.wait()
 
-        finally:
-            # if process still running, attempt best-effort cleanup
-            if process.returncode is None:
-                process.terminate()
+    finally:
+        # if process still running, attempt best-effort cleanup
+        if process.returncode is None:
+            process.terminate()
+
+
+if __name__ == '__main__':
+    worker_main()

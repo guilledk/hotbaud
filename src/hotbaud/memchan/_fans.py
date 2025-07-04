@@ -27,6 +27,7 @@ MemoryChannel One-to-Many / Many-to-One helpers
 '''
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 import itertools
 
 from heapq import heappush, heappop
@@ -45,6 +46,8 @@ from ._impl import (
     attach_to_memory_receiver,
 )
 
+from tractor.trionics import maybe_raise_from_masking_exc
+
 
 class OrderedMsg(MessageStruct, frozen=True):
     index: int
@@ -62,47 +65,35 @@ class FanOutSender:
         ordered: bool = False,
     ):
         if not out_tokens:
-            raise ValueError(
-                'FanOutSender expects at least one downstream token'
-            )
-
+            raise ValueError('FanOutSender expects at least one downstream token')
         self.out_tokens = list(out_tokens)
         self.batch_size = batch_size
         self.ordered = ordered
-        # stable, monotonically increasing sequence number (for optional ordering)
         self._seq = itertools.count().__next__
-        # round‑robin pointer
         self._rr_idx = 0
+        self._senders: list[trio.MemorySendChannel] = []
+        self._stack: AsyncExitStack | None = None   # NEW
 
     async def __aenter__(self):
-        cmgrs = [
-            attach_to_memory_sender(tok, batch_size=self.batch_size)
-            for tok in self.out_tokens
-        ]
-        # lazily enter the child contexts (order preserved)
-        # keep references for __aexit__
-        self._sender_cmgrs = cmgrs
-        self._senders = [await cm.__aenter__() for cm in cmgrs]
+        self._stack = AsyncExitStack()
+        # enter each child context through the stack
+        for tok in self.out_tokens:
+            sender_cm = attach_to_memory_sender(tok, batch_size=self.batch_size)
+            sender = await self._stack.enter_async_context(sender_cm)
+            self._senders.append(sender)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        # flush + close all children *in reverse order* to mirror stack unwinding
-        for cm in self._sender_cmgrs[::-1]:
-            await cm.__aexit__(exc_type, exc, tb)
+        # one call cleans up everything – even on partial failure
+         await self._stack.aclose()
 
     async def send(self, payload: bytes | bytearray | memoryview) -> None:
-        '''
-        Send *payload* to the next downstream receiver.
-
-        '''
         sender = self._senders[self._rr_idx]
         self._rr_idx = (self._rr_idx + 1) % len(self._senders)
-
-        raw = payload
-        if self.ordered:
-            raw = OrderedMsg(index=self._seq(), msg=payload).encode()
-
-        # Let the underlying channel deal with flow‑control / back‑pressure
+        raw = (
+            OrderedMsg(index=self._seq(), msg=payload).encode()
+            if self.ordered else payload
+        )
         await sender.send(raw)
 
 
@@ -110,22 +101,19 @@ class FanInReceiver:
     def __init__(
         self,
         in_tokens: Sequence[MCToken],
+        *,
         ordered: bool = False,
         start_index: int = 0,
     ):
         if len(in_tokens) < 2:
             raise ValueError('FanInReceiver expects at least 2 upstream tokens')
-
         self.in_tokens = list(in_tokens)
         self.ordered = ordered
-
-        self._send, self._recv = trio.open_memory_channel[tuple[int, bytes]](
-            max_buffer_size=0
-        )
-
-        # only used when ordered == True
+        self._send, self._recv = trio.open_memory_channel(0)
         self._next_index = start_index
-        self._pqueue = []
+        self._pqueue: list[tuple[int, tuple[int, bytes]]] = []
+        self._receivers: list[trio.MemoryReceiveChannel] = []
+        self._stack: AsyncExitStack | None = None   # NEW
 
     def _can_pop_next(self) -> bool:
         return len(self._pqueue) > 0 and self._pqueue[0][0] == self._next_index
@@ -142,18 +130,18 @@ class FanInReceiver:
         return msg
 
     async def __aenter__(self):
-        cmgrs = [attach_to_memory_receiver(tok) for tok in self.in_tokens]
-        self._recv_cmgrs = cmgrs
-        self._receivers = [await cm.__aenter__() for cm in cmgrs]  # type: ignore[misc]
-        return self  # acts as async iterator
+        self._stack = AsyncExitStack()
+        for tok in self.in_tokens:
+            recv_cm = attach_to_memory_receiver(tok)
+            receiver = await self._stack.enter_async_context(recv_cm)
+            self._receivers.append(receiver)
+        return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        for cm in self._recv_cmgrs[::-1]:
-            await cm.__aexit__(exc_type, exc, tb)  # type: ignore[misc]
+        async with maybe_raise_from_masking_exc():
+            await self._stack.aclose()
 
-    def __aiter__(
-        self,
-    ) -> AsyncIterator[tuple[int, bytes]]:
+    def __aiter__(self) -> AsyncIterator[tuple[int, bytes]]:
         return self._run()
 
     async def _receive_ordered(self) -> tuple[int, bytes]:

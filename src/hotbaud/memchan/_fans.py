@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -22,15 +22,15 @@
 '''
 MemoryChannel One-to-Many / Many-to-One helpers
 
-(WIP)
-
 '''
+
 from __future__ import annotations
 
+from contextlib import AsyncExitStack, asynccontextmanager
 import itertools
 
 from heapq import heappush, heappop
-from typing import AsyncIterator, Sequence
+from typing import AsyncGenerator, AsyncIterator, Awaitable, Protocol, Sequence
 
 import trio
 import msgspec
@@ -38,6 +38,7 @@ import msgspec
 from msgspec import Raw
 
 from hotbaud._utils import MessageStruct
+from hotbaud.types import Buffer
 
 from ._impl import (
     MCToken,
@@ -54,141 +55,120 @@ class OrderedMsg(MessageStruct, frozen=True):
         return msgspec.msgpack.decode(self.msg, **kwargs)
 
 
-class FanOutSender:
-    def __init__(
-        self,
-        out_tokens: Sequence[MCToken],
-        batch_size: int = 1,
-        ordered: bool = False,
-    ):
-        if not out_tokens:
-            raise ValueError(
-                'FanOutSender expects at least one downstream token'
+class FanOutSendFn(Protocol):
+    def __call__(
+        self, payload: Buffer, *, broadcast: bool = False
+    ) -> Awaitable[None]: ...
+
+
+@asynccontextmanager
+async def attach_fan_out_sender(
+    out_tokens: Sequence[MCToken],
+    *,
+    batch_size: int = 1,
+    ordered: bool = False,
+) -> AsyncGenerator[FanOutSendFn, None]:
+    if not out_tokens:
+        raise ValueError('attach_fan_out_sender expects at least one token')
+
+    seq = itertools.count().__next__  # monotonically increasing index
+    rr_idx = 0  # round-robin pointer
+
+    async with AsyncExitStack() as stack:
+        senders = [
+            await stack.enter_async_context(
+                attach_to_memory_sender(t, batch_size=batch_size)
+            )
+            for t in out_tokens
+        ]
+
+        async def send(payload: Buffer, broadcast: bool = False) -> None:
+            raw = (
+                OrderedMsg(index=seq(), msg=payload).encode()
+                if ordered
+                else payload
             )
 
-        self.out_tokens = list(out_tokens)
-        self.batch_size = batch_size
-        self.ordered = ordered
-        # stable, monotonically increasing sequence number (for optional ordering)
-        self._seq = itertools.count().__next__
-        # round‑robin pointer
-        self._rr_idx = 0
+            if broadcast:
+                async with trio.open_nursery() as n:
+                    for sender in senders:
+                        n.start_soon(sender.send, raw)
 
-    async def __aenter__(self):
-        cmgrs = [
-            attach_to_memory_sender(tok, batch_size=self.batch_size)
-            for tok in self.out_tokens
+                return
+
+            nonlocal rr_idx
+            sender = senders[rr_idx]
+            rr_idx = (rr_idx + 1) % len(senders)
+
+            await sender.send(raw)
+
+        yield send
+
+
+@asynccontextmanager
+async def attach_fan_in_receiver(
+    in_tokens: Sequence[MCToken],
+    *,
+    ordered: bool = False,
+    start_index: int = 0,
+) -> AsyncGenerator[AsyncIterator[tuple[int, bytes]], None]:
+    if len(in_tokens) < 2:
+        raise ValueError('attach_fan_in_receiver expects ≥2 tokens')
+
+    send, recv = trio.open_memory_channel(0)
+
+    async with trio.open_nursery() as nursery, AsyncExitStack() as stack:
+        # open all upstream receivers
+        receivers = [
+            await stack.enter_async_context(attach_to_memory_receiver(t))
+            for t in in_tokens
         ]
-        # lazily enter the child contexts (order preserved)
-        # keep references for __aexit__
-        self._sender_cmgrs = cmgrs
-        self._senders = [await cm.__aenter__() for cm in cmgrs]
-        return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        # flush + close all children *in reverse order* to mirror stack unwinding
-        for cm in self._sender_cmgrs[::-1]:
-            await cm.__aexit__(exc_type, exc, tb)
+        # background pumps – one per upstream channel
+        async def _pump(idx: int, rcv):
+            async for msg in rcv:
+                await send.send((idx, msg))
+            await send.send((idx, None))  # sentinel
 
-    async def send(self, payload: bytes | bytearray | memoryview) -> None:
-        '''
-        Send *payload* to the next downstream receiver.
+        for i, r in enumerate(receivers):
+            nursery.start_soon(_pump, i, r)
 
-        '''
-        sender = self._senders[self._rr_idx]
-        self._rr_idx = (self._rr_idx + 1) % len(self._senders)
+        # ordered-delivery helpers
+        next_idx = start_index
+        pqueue: list[tuple[int, tuple[int, bytes]]] = []
 
-        raw = payload
-        if self.ordered:
-            raw = OrderedMsg(index=self._seq(), msg=payload).encode()
+        def can_pop() -> bool:
+            return bool(pqueue) and pqueue[0][0] == next_idx
 
-        # Let the underlying channel deal with flow‑control / back‑pressure
-        await sender.send(raw)
+        async def drain_heap():
+            while not can_pop():
+                i, raw = await recv.receive()
+                om = OrderedMsg.from_bytes(raw)
+                heappush(pqueue, (om.index, (i, om.unwrap())))
 
+        async def pop_ordered() -> tuple[int, bytes]:
+            nonlocal next_idx
+            if not can_pop():
+                await drain_heap()
+            _, pair = heappop(pqueue)
+            next_idx += 1
+            return pair
 
-class FanInReceiver:
-    def __init__(
-        self,
-        in_tokens: Sequence[MCToken],
-        ordered: bool = False,
-        start_index: int = 0,
-    ):
-        if len(in_tokens) < 2:
-            raise ValueError('FanInReceiver expects at least 2 upstream tokens')
-
-        self.in_tokens = list(in_tokens)
-        self.ordered = ordered
-
-        self._send, self._recv = trio.open_memory_channel[tuple[int, bytes]](
-            max_buffer_size=0
-        )
-
-        # only used when ordered == True
-        self._next_index = start_index
-        self._pqueue = []
-
-    def _can_pop_next(self) -> bool:
-        return len(self._pqueue) > 0 and self._pqueue[0][0] == self._next_index
-
-    async def _drain_to_heap(self):
-        while not self._can_pop_next():
-            idx, msg = await self._recv.receive()
-            msg = OrderedMsg.from_bytes(msg)
-            heappush(self._pqueue, (msg.index, (idx, msg.unwrap())))
-
-    def _pop_next(self) -> tuple[int, bytes]:
-        _, msg = heappop(self._pqueue)
-        self._next_index += 1
-        return msg
-
-    async def __aenter__(self):
-        cmgrs = [attach_to_memory_receiver(tok) for tok in self.in_tokens]
-        self._recv_cmgrs = cmgrs
-        self._receivers = [await cm.__aenter__() for cm in cmgrs]  # type: ignore[misc]
-        return self  # acts as async iterator
-
-    async def __aexit__(self, exc_type, exc, tb):
-        for cm in self._recv_cmgrs[::-1]:
-            await cm.__aexit__(exc_type, exc, tb)  # type: ignore[misc]
-
-    def __aiter__(
-        self,
-    ) -> AsyncIterator[tuple[int, bytes]]:
-        return self._run()
-
-    async def _receive_ordered(self) -> tuple[int, bytes]:
-        if self._can_pop_next():
-            return self._pop_next()
-
-        await self._drain_to_heap()
-        return self._pop_next()
-
-    async def _receive(self) -> tuple[int, bytes]:
-        return await self._recv.receive()
-
-    async def _run(self):
-        '''
-        Background task that concurrently receives from *all* senders.
-
-        '''
-        recv_fn = self._receive if not self.ordered else self._receive_ordered
-        async with trio.open_nursery() as nursery:
-
-            async def _pump(idx: int, receiver):
-                async for msg in receiver:
-                    await self._send.send((idx, msg))
-                await self._send.send((idx, None))  # sentinel
-
-            # Start one task per upstream receiver
-            for i, r in enumerate(self._receivers):
-                nursery.start_soon(_pump, i, r)
-
+        async def _iter():
             finished = 0
             while True:
-                idx, payload = await recv_fn()
-                if payload is None:  # got sentinel from _pump()
-                    finished += 1
-                    if finished == len(self._receivers):
-                        break
+                if ordered:
+                    idx, payload = await pop_ordered()
                 else:
-                    yield idx, payload
+                    idx, payload = await recv.receive()
+
+                if payload is None:  # got sentinel
+                    finished += 1
+                    if finished == len(receivers):
+                        break
+                    continue
+
+                yield idx, payload
+
+        yield _iter()  # give caller the async-iterator
+        nursery.cancel_scope.cancel()  # stop pumps on exit

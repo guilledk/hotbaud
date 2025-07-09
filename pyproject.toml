@@ -13,9 +13,6 @@ dependencies = [
     'trio-asyncio>=0.15.0',
 ]
 
-[project.scripts]
-hotbaud-worker = 'hotbaud.experimental._worker:worker_main'
-
 [tool.hatch.metadata]
 allow-direct-references = true
 

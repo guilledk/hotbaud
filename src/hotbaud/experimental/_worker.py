@@ -36,10 +36,12 @@ partial originally passed to `run_in_worker`.
 
 '''
 
+import logging
 import os
 import inspect
 import pkgutil
 
+import sys
 from typing import Any, Self
 from functools import partial
 
@@ -47,6 +49,9 @@ import trio
 import trio_asyncio
 
 from hotbaud._utils import MessageStruct, namespace_for
+
+
+log = logging.getLogger(__name__)
 
 
 spec_env_var = 'HOTBAUD_WORKER_SPEC'
@@ -114,14 +119,24 @@ def worker_main() -> None:
     # inject worker_id keyword arg from spec id
     task.keywords['worker_id'] = spec.id
 
-    if spec.task.is_async:
-        if not spec.asyncio:
-            trio.run(task)
-        else:
-            trio_asyncio.run(task)
+    log.info(f'Worker {spec.id} starting...')
 
-    else:
-        task()
+    try:
+        if spec.task.is_async:
+            if not spec.asyncio:
+                trio.run(task)
+            else:
+                trio_asyncio.run(task)
+
+        else:
+            task()
+
+    except Exception as e:
+        e.add_note(f'With <3 from worker {spec.id}')
+        raise
+
+    finally:
+        log.info(f'Worker {spec.id} stopping...')
 
 
 async def run_in_worker(
@@ -147,21 +162,22 @@ async def run_in_worker(
 
     # spawn the child
     cmd = [
-        # alias for `worker_main` function (defined in pyproject.toml)
-        'hotbaud-worker',
+        sys.executable,
+        '-m',
+        'hotbaud.experimental._worker',
         worker_id,  # just so worker id is shown on process info
     ]
 
-    async with trio.open_nursery() as nursery:
-        process: trio.Process = await nursery.start(
-            partial(trio.run_process, cmd, env=env, **kwargs)
-        )
+    process: trio.Process = await trio.lowlevel.open_process(cmd, env=env, **kwargs)
 
-        # trio.run_process will propagate cancellation & errors
-        try:
-            await process.wait()
+    try:
+        await process.wait()
 
-        finally:
-            # if process still running, attempt best-effort cleanup
-            if process.returncode is None:
-                process.terminate()
+    finally:
+        # if process still running, attempt best-effort cleanup
+        if process.returncode is None:
+            process.terminate()
+
+
+if __name__ == '__main__':
+    worker_main()

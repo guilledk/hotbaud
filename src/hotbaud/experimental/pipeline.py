@@ -42,6 +42,7 @@ from pathlib import Path
 from functools import partial
 from dataclasses import dataclass
 
+import msgspec
 import trio
 from trio.socket import SocketType
 
@@ -151,10 +152,14 @@ class PipelineBuilder:
         self,
         pipe_id: str,
         *,
+        global_config: dict | msgspec.Struct | None = None,
+        log_setup: Callable[[], None] | None = None,
         sync_backend: EFDSyncMethods = default_sync_method,
         share_path: Path | str = Path('.hotbaud/share')
     ):
         self.pipe_id = pipe_id
+        self._config = global_config
+        self._log_setup = log_setup
         self._sync_backend: EFDSyncMethods = sync_backend
         self._stages: list[StageDef] = []
         self._channels: dict[str, ChannelDef] = {}
@@ -433,7 +438,9 @@ class PipelineBuilder:
                 wid = f'{sdef.id}[{idx}]'
                 workers.append(PipelineWorker(id=wid, func=func, stage=sdef))
 
-        return Pipeline(self.pipe_id, self._stages, workers, self._channels)
+        return Pipeline(
+            self.pipe_id, self._stages, workers, self._channels, self._config, self._log_setup
+        )
 
 
 class WorkerSpawnFn(Protocol):
@@ -443,6 +450,8 @@ class WorkerSpawnFn(Protocol):
         task: partial,
         *,
         asyncio: bool,
+        config: dict | msgspec.Struct | None,
+        log_setup: Callable[[], None] | None
     ) -> Awaitable[Any]: ...
 
 
@@ -465,11 +474,15 @@ class Pipeline:
         stages: list[StageDef],
         workers: list[PipelineWorker],
         channels: dict[str, ChannelDef],
+        global_config: dict | msgspec.Struct | None,
+        log_setup: Callable[[], None] | None
     ) -> None:
         self.pipe_id = pipe_id
         self.stages = stages
         self.workers = workers
         self.channels = channels
+        self.global_config = global_config
+        self.log_setup = log_setup
 
     async def run(self, *, spawn_fn: WorkerSpawnFn = run_in_worker) -> None:
         '''
@@ -493,14 +506,20 @@ class Pipeline:
                 # spawn all workers
                 for w in self.workers:
                     worker_nursery.start_soon(
-                        partial(spawn_fn, w.id, w.func, asyncio=w.stage.asyncio)
+                        partial(
+                            spawn_fn,
+                            w.id,
+                            w.func,
+                            asyncio=w.stage.asyncio,
+                            config=self.global_config,
+                            log_setup=self.log_setup
+                        )
                     )
 
                 log.info(
-                    'pipeline %s started with %d workers across %d stages',
-                    self.pipe_id,
-                    len(self.workers),
-                    len(self.stages),
+                    f'pipeline {self.pipe_id} started with '
+                    f'{len(self.workers)} workers across '
+                    f'{len(self.stages)} stages'
                 )
 
                 # trio will now block on this scope until all worker tasks return

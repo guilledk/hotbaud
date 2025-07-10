@@ -42,9 +42,10 @@ import inspect
 import pkgutil
 
 import sys
-from typing import Any, Self
+from typing import Any, Callable, Self
 from functools import partial
 
+import msgspec
 import trio
 import trio_asyncio
 
@@ -92,6 +93,24 @@ class WorkerSpec(MessageStruct, frozen=True):
     id: str
     task: TaskSpec
     asyncio: bool = False
+    config: dict | None = None
+    config_type: str | None = None
+    log_setup: str | None = None
+
+    def unwrap_config(self) -> dict | msgspec.Struct | None:
+        if not self.config or not self.config_type:
+            return None
+
+        if self.config_type == 'dict':
+            return self.config
+
+        cfg_type = pkgutil.resolve_name(self.config_type)
+        return msgspec.convert(self.config, type=cfg_type)
+
+    def maybe_setup_log(self) -> None:
+        if self.log_setup:
+            log_setup_fn = pkgutil.resolve_name(self.log_setup)
+            log_setup_fn()
 
 
 def worker_main() -> None:
@@ -113,11 +132,18 @@ def worker_main() -> None:
     # parse spec
     spec = WorkerSpec.from_json(encoded_spec)
 
+    # maybe run user's logging setup
+    spec.maybe_setup_log()
+
     # unpack to actual partial
     task = spec.task.to_partial()
 
     # inject worker_id keyword arg from spec id
     task.keywords['worker_id'] = spec.id
+
+    # mabye inject config
+    if (config := spec.unwrap_config()):
+        task.keywords['config'] = config
 
     log.info(f'Worker {spec.id} starting...')
 
@@ -140,7 +166,13 @@ def worker_main() -> None:
 
 
 async def run_in_worker(
-    worker_id: str, task: partial, *, asyncio: bool = False, **kwargs
+    worker_id: str,
+    task: partial,
+    *,
+    asyncio: bool = False,
+    config: dict | msgspec.Struct | None,
+    log_setup: Callable[[], None] | None,
+    **kwargs
 ) -> None:
     '''
     Run a callable or awaitable (trio or asyncio style) function inside a
@@ -152,9 +184,32 @@ async def run_in_worker(
      value, events etc.
 
     '''
+    config_type: str | None = None
+    config_dict: dict | None = None
+    if config is not None:
+        # pass config dict or struct as well as info to re-build it if its a struct
+        config_type = (
+            'dict'
+            if isinstance(config, dict)
+            else namespace_for(type(config))
+        )
+        config_dict = (
+            config
+            if isinstance(config, dict)
+            else msgspec.to_builtins(config)
+        )
+
+    # also pass namespace of log_setup function if user passed it
+    log_setup_ns: str | None = namespace_for(log_setup) if log_setup else None
+
     # pack everything we need into env var
     spec = WorkerSpec(
-        id=worker_id, task=TaskSpec.from_partial(task), asyncio=asyncio
+        id=worker_id,
+        task=TaskSpec.from_partial(task),
+        config=config_dict,
+        config_type=config_type,
+        asyncio=asyncio,
+        log_setup=log_setup_ns
     )
 
     env = os.environ.copy()

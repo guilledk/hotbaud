@@ -46,7 +46,8 @@ import msgspec
 import trio
 from trio.socket import SocketType
 
-from hotbaud.eventfd import EFDSyncMethods, default_sync_method
+from hotbaud.eventfd import EFD_NONBLOCK, EFD_SEMAPHORE, EFDSyncMethods, default_sync_method, open_eventfd
+from hotbaud.experimental.event import AsyncEvent
 from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
     MCToken,
@@ -100,6 +101,7 @@ class StageDef:
 
     id: str
     func: partial
+    exit_fd: AsyncEvent | None
     size: int = 1
     asyncio: bool = False
 
@@ -196,10 +198,10 @@ class PipelineBuilder:
             if isinstance(strategy, ConnectionStrategy)
             else ConnectionStrategy(strategy)
         )
-
         sdef = StageDef(
             id=f'{self.pipe_id}.{sid}',
             func=func,
+            exit_fd=None,
             size=size,
             inputs=(inputs,)
             if isinstance(inputs, str)
@@ -318,11 +320,16 @@ class PipelineBuilder:
                 if need > 1:
                     outs = _dup(outs[0], need)
 
+            exit_fd = None
+            if idx < len(self._stages) - 1:
+                exit_fd = AsyncEvent(open_eventfd(flags=EFD_NONBLOCK | EFD_SEMAPHORE))
+
             # build a fresh, *expanded* StageDef
             new_stages.append(
                 StageDef(
                     id=s.id,
                     func=s.func,
+                    exit_fd=exit_fd,
                     size=s.size,
                     inputs=inps,
                     in_size=s.in_size,
@@ -399,7 +406,8 @@ class PipelineBuilder:
 
         workers: list[PipelineWorker] = []
 
-        for sdef in self._stages:
+        for i, sdef in enumerate(self._stages):
+            is_last = i == len(self._stages) - 1
             # inject, depending on topology, the input and/or output token or
             # tokens into the function's `in_token(s)` & `out_token(s)` keyword
             # arguments
@@ -448,6 +456,7 @@ class WorkerSpawnFn(Protocol):
         self,
         worker_id: str,
         task: partial,
+        exit_fd: int | None,
         *,
         asyncio: bool,
         config: dict | msgspec.Struct | None,
@@ -484,12 +493,67 @@ class Pipeline:
         self.global_config = global_config
         self.log_setup = log_setup
 
+    async def run_stage(
+        self,
+        stage: StageDef,
+        *,
+        spawn_fn: WorkerSpawnFn = run_in_worker,
+        task_status = trio.TASK_STATUS_IGNORED
+    ) -> None:
+        '''
+        '''
+        idx = self.stages.index(stage)
+
+        # find prev stage's exit_event
+        prev_stage = None
+        exit_event: AsyncEvent | None = None
+        if idx > 0:
+            prev_stage = self.stages[idx - 1]
+            exit_event = prev_stage.exit_fd
+
+        # gather this stage's workers
+        workers = tuple((
+            w
+            for w in self.workers
+            if w.stage == stage
+        ))
+
+        async with trio.open_nursery() as nursery:
+            for w in workers:
+                nursery.start_soon(
+                    partial(
+                        spawn_fn,
+                        w.id,
+                        w.func,
+                        w.stage.exit_fd.fd if w.stage.exit_fd else None,
+                        asyncio=w.stage.asyncio,
+                        config=self.global_config,
+                        log_setup=self.log_setup
+                    )
+                )
+
+            log.info(
+                f'stage {stage.id} {idx} started with {len(workers)} workers'
+            )
+            task_status.started()
+
+        # first stage wont do any exit sets
+        if exit_event:
+            try:
+                exit_event.set()
+
+            except Exception as e:
+                e.add_note(f'while setting stage {stage.id} (index: {idx}) exit event')
+                if prev_stage:
+                    e.add_note(
+                    f'target exit event was stage {prev_stage.id} (index {idx - 1})'
+                    )
+
     async def run(self, *, spawn_fn: WorkerSpawnFn = run_in_worker) -> None:
         '''
         Long running pipeline task.
 
-        Start all fdshare tasks for channels that need it, then spawn all long
-        running worker tasks
+        Start all fdshare tasks for channels that need it, then spawn stages
 
         '''
         async with trio.open_nursery() as nursery:
@@ -501,18 +565,15 @@ class Pipeline:
                     nursery.start_soon(c.fdshare_task)
 
             # use an inner nursery in order to have separate task scopes for
-            # worker tasks & fd share tasks
-            async with trio.open_nursery() as worker_nursery:
+            # stage tasks & fd share tasks
+            async with trio.open_nursery() as stage_nursery:
                 # spawn all workers
-                for w in self.workers:
-                    worker_nursery.start_soon(
+                for s in self.stages:
+                    await stage_nursery.start(
                         partial(
-                            spawn_fn,
-                            w.id,
-                            w.func,
-                            asyncio=w.stage.asyncio,
-                            config=self.global_config,
-                            log_setup=self.log_setup
+                            self.run_stage,
+                            s,
+                            spawn_fn=spawn_fn
                         )
                     )
 
@@ -522,7 +583,7 @@ class Pipeline:
                     f'{len(self.stages)} stages'
                 )
 
-                # trio will now block on this scope until all worker tasks return
+                # trio will now block on this scope until all stage tasks return
 
             # cancel fd share tasks
             nursery.cancel_scope.cancel()

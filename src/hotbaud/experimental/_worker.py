@@ -36,20 +36,25 @@ partial originally passed to `run_in_worker`.
 
 '''
 
-import logging
 import os
+import sys
+import logging
 import inspect
 import pkgutil
 
-import sys
 from typing import Any, Callable, Self
 from functools import partial
+from contextlib import suppress
 
-import msgspec
 import trio
 import trio_asyncio
+import msgspec
 
 from hotbaud._utils import MessageStruct, namespace_for
+
+# eventualy move hotbaud.experimental.event into hotbaud.event and stop using
+# relative import
+from .event import Event
 
 
 log = logging.getLogger(__name__)
@@ -92,6 +97,7 @@ class WorkerSpec(MessageStruct, frozen=True):
 
     id: str
     task: TaskSpec
+    exit_fd: int | None
     asyncio: bool = False
     config: dict | None = None
     config_type: str | None = None
@@ -145,7 +151,10 @@ def worker_main() -> None:
     if (config := spec.unwrap_config()):
         task.keywords['config'] = config
 
-    log.info(f'Worker {spec.id} starting...')
+    # open exit event
+    exit_event = Event(spec.exit_fd)
+
+    log.info(f'{spec.id} starting...')
 
     try:
         if spec.task.is_async:
@@ -158,16 +167,39 @@ def worker_main() -> None:
             task()
 
     except Exception as e:
-        e.add_note(f'With <3 from worker {spec.id}')
+        e.add_note(f'with <3 from worker {spec.id}')
         raise
 
     finally:
-        log.info(f'Worker {spec.id} stopping...')
+        if exit_event:
+            log.info(f'{spec.id} waiting on prev stage exit event...')
+
+            # attempt waiting on prev stage exit event capture error on failure
+            with suppress(Exception) as e:
+                exit_event.wait()
+
+            # just log what happened and exit
+            if e is None:
+                # exit event received correctly
+                log.info(f'{spec.id} received exit event, stopping...')
+
+            else:
+                # failed to wait on exit event, likely broken fd?
+                log.warning(
+                    f'{spec.id} failed read on exit event, stopping...',
+                    exc_info=e
+                )
+
+        else:
+            # if we are last step of pipeline we dont need to wait on any exit
+            # event
+            log.info(f'{spec.id} exiting...')
 
 
 async def run_in_worker(
     worker_id: str,
     task: partial,
+    exit_fd: int | None,
     *,
     asyncio: bool = False,
     config: dict | msgspec.Struct | None,
@@ -206,6 +238,7 @@ async def run_in_worker(
     spec = WorkerSpec(
         id=worker_id,
         task=TaskSpec.from_partial(task),
+        exit_fd=exit_fd,
         config=config_dict,
         config_type=config_type,
         asyncio=asyncio,
@@ -223,7 +256,16 @@ async def run_in_worker(
         worker_id,  # just so worker id is shown on process info
     ]
 
-    process: trio.Process = await trio.lowlevel.open_process(cmd, env=env, **kwargs)
+    # TODO: pass exit_fd though our own medium (hotbaud._fdshare)
+    if exit_fd is not None:
+        if 'pass_fds' not in kwargs:
+            kwargs['pass_fds'] = []
+
+        kwargs['pass_fds'].append(exit_fd)
+
+    process: trio.Process = await trio.lowlevel.open_process(
+        cmd, env=env, **kwargs
+    )
 
     try:
         await process.wait()

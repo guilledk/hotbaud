@@ -126,9 +126,13 @@ async def attach_fan_in_receiver(
 
         # background pumps – one per upstream channel
         async def _pump(idx: int, rcv):
-            async for msg in rcv:
-                await send.send((idx, msg))
-            await send.send((idx, None))  # sentinel
+            try:
+                async for msg in rcv:
+                    await send.send((idx, msg))
+                await send.send((idx, None))  # sentinel
+
+            except trio.ClosedResourceError:
+                ...
 
         for i, r in enumerate(receivers):
             nursery.start_soon(_pump, i, r)
@@ -171,4 +175,5 @@ async def attach_fan_in_receiver(
                 yield idx, payload
 
         yield _iter()  # give caller the async-iterator
-        nursery.cancel_scope.cancel()  # stop pumps on exit
+        for receiver in receivers:
+            await receiver.aclose()

@@ -43,6 +43,7 @@ import inspect
 import pkgutil
 
 from typing import Any, Callable, Self
+from logging import Logger
 from functools import partial
 from contextlib import suppress
 
@@ -55,9 +56,6 @@ from hotbaud._utils import MessageStruct, namespace_for
 # eventualy move hotbaud.experimental.event into hotbaud.event and stop using
 # relative import
 from .event import Event
-
-
-log = logging.getLogger(__name__)
 
 
 spec_env_var = 'HOTBAUD_WORKER_SPEC'
@@ -113,10 +111,12 @@ class WorkerSpec(MessageStruct, frozen=True):
         cfg_type = pkgutil.resolve_name(self.config_type)
         return msgspec.convert(self.config, type=cfg_type)
 
-    def maybe_setup_log(self) -> None:
+    def setup_log(self) -> Logger:
         if self.log_setup:
             log_setup_fn = pkgutil.resolve_name(self.log_setup)
             log_setup_fn()
+
+        return logging.getLogger(self.id)
 
 
 def worker_main() -> None:
@@ -138,11 +138,12 @@ def worker_main() -> None:
     # parse spec
     spec = WorkerSpec.from_json(encoded_spec)
 
-    # maybe run user's logging setup
-    spec.maybe_setup_log()
-
     # unpack to actual partial
     task = spec.task.to_partial()
+
+    # maybe run user's log setup & get worker logger
+    log = spec.setup_log()
+    task.keywords['log'] = log
 
     # inject worker_id keyword arg from spec id
     task.keywords['worker_id'] = spec.id
@@ -151,12 +152,19 @@ def worker_main() -> None:
     if (config := spec.unwrap_config()):
         task.keywords['config'] = config
 
-    # open exit event
-    exit_event = Event(spec.exit_fd)
+    # maybe open exit event:
+    # depending on the stage this worker belongs to it might need to wait on
+    # next stage's exit `Event` in order to keep channel resources alive while
+    # next stage hasnt exited, last stage workers dont need to wait so their
+    # exit_fd is None
+    exit_event = None
+    if spec.exit_fd:
+        exit_event = Event(spec.exit_fd)
 
-    log.info(f'{spec.id} starting...')
+    log.info('starting...')
 
     try:
+        # finally run unwrapped user task, choose right runtime based on params
         if spec.task.is_async:
             if not spec.asyncio:
                 trio.run(task)
@@ -167,33 +175,35 @@ def worker_main() -> None:
             task()
 
     except Exception as e:
+        # on errors we append worker id info and just raise
         e.add_note(f'with <3 from worker {spec.id}')
         raise
 
     finally:
         if exit_event:
-            log.info(f'{spec.id} waiting on prev stage exit event...')
+            # this worker belongs to a stage other than the last, wait next
+            # stage's workers to exit before exiting ourselves
+            log.info('waiting on prev stage exit event...')
 
             # attempt waiting on prev stage exit event capture error on failure
-            with suppress(Exception) as e:
+            # with suppress(Exception) as e:
+            try:
                 exit_event.wait()
+                log.info('received exit event, stopping...')
 
-            # just log what happened and exit
-            if e is None:
-                # exit event received correctly
-                log.info(f'{spec.id} received exit event, stopping...')
-
-            else:
+            except Exception as e:
                 # failed to wait on exit event, likely broken fd?
+                # just log warning and exit, we dont want to hide any real
+                # errors
                 log.warning(
-                    f'{spec.id} failed read on exit event, stopping...',
+                    'failed read on exit event, stopping...',
                     exc_info=e
                 )
 
         else:
             # if we are last step of pipeline we dont need to wait on any exit
             # event
-            log.info(f'{spec.id} exiting...')
+            log.info('exiting...')
 
 
 async def run_in_worker(

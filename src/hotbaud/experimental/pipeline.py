@@ -46,8 +46,8 @@ import msgspec
 import trio
 from trio.socket import SocketType
 
-from hotbaud.eventfd import EFD_NONBLOCK, EFD_SEMAPHORE, EFDSyncMethods, default_sync_method, open_eventfd
-from hotbaud.experimental.event import AsyncEvent
+from hotbaud.eventfd import EFD_SEMAPHORE, EFDSyncMethods, default_sync_method, open_eventfd
+from hotbaud.experimental.event import Event
 from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
     MCToken,
@@ -101,7 +101,7 @@ class StageDef:
 
     id: str
     func: partial
-    exit_fd: AsyncEvent | None
+    exit_fd: Event | None
     size: int = 1
     asyncio: bool = False
 
@@ -321,8 +321,8 @@ class PipelineBuilder:
                     outs = _dup(outs[0], need)
 
             exit_fd = None
-            if idx < len(self._stages) - 1:
-                exit_fd = AsyncEvent(open_eventfd(flags=EFD_NONBLOCK | EFD_SEMAPHORE))
+            if idx > 0:
+                exit_fd = Event(open_eventfd(flags=EFD_SEMAPHORE))
 
             # build a fresh, *expanded* StageDef
             new_stages.append(
@@ -406,8 +406,7 @@ class PipelineBuilder:
 
         workers: list[PipelineWorker] = []
 
-        for i, sdef in enumerate(self._stages):
-            is_last = i == len(self._stages) - 1
+        for sdef in self._stages:
             # inject, depending on topology, the input and/or output token or
             # tokens into the function's `in_token(s)` & `out_token(s)` keyword
             # arguments
@@ -504,12 +503,12 @@ class Pipeline:
         '''
         idx = self.stages.index(stage)
 
-        # find prev stage's exit_event
-        prev_stage = None
-        exit_event: AsyncEvent | None = None
-        if idx > 0:
-            prev_stage = self.stages[idx - 1]
-            exit_event = prev_stage.exit_fd
+        # find next stage's exit_event
+        next_stage = None
+        exit_event: Event | None = None
+        if idx < len(self.stages) - 1:
+            next_stage = self.stages[idx + 1]
+            exit_event = next_stage.exit_fd
 
         # gather this stage's workers
         workers = tuple((
@@ -525,7 +524,7 @@ class Pipeline:
                         spawn_fn,
                         w.id,
                         w.func,
-                        w.stage.exit_fd.fd if w.stage.exit_fd else None,
+                        exit_event.fd if exit_event else None,
                         asyncio=w.stage.asyncio,
                         config=self.global_config,
                         log_setup=self.log_setup
@@ -538,16 +537,13 @@ class Pipeline:
             task_status.started()
 
         # first stage wont do any exit sets
-        if exit_event:
+        if stage.exit_fd:
             try:
-                exit_event.set()
+                stage.exit_fd.set()
+                log.info(f'stage {stage.id} set exit')
 
             except Exception as e:
-                e.add_note(f'while setting stage {stage.id} (index: {idx}) exit event')
-                if prev_stage:
-                    e.add_note(
-                    f'target exit event was stage {prev_stage.id} (index {idx - 1})'
-                    )
+                log.warning(f'while setting stage {stage.id} (index: {idx}) exit event', exc_info=e)
 
     async def run(self, *, spawn_fn: WorkerSpawnFn = run_in_worker) -> None:
         '''

@@ -163,6 +163,8 @@ def worker_main() -> None:
 
     log.info('starting...')
 
+    exception_raised = False
+
     try:
         # finally run unwrapped user task, choose right runtime based on params
         if spec.task.is_async:
@@ -177,16 +179,14 @@ def worker_main() -> None:
     except Exception as e:
         # on errors we append worker id info and just raise
         e.add_note(f'with <3 from worker {spec.id}')
+        exception_raised = True
         raise
 
     finally:
-        if exit_event:
+        if exit_event and not exception_raised:
             # this worker belongs to a stage other than the last, wait next
             # stage's workers to exit before exiting ourselves
-            log.info('waiting on prev stage exit event...')
-
             # attempt waiting on prev stage exit event capture error on failure
-            # with suppress(Exception) as e:
             try:
                 exit_event.wait()
                 log.info('received exit event, stopping...')

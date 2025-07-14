@@ -124,7 +124,7 @@ async def attach_fan_in_receiver(
             for t in in_tokens
         ]
 
-        # background pumps – one per upstream channel
+        # background pumps - one per upstream channel
         async def _pump(idx: int, rcv):
             try:
                 async for msg in rcv:

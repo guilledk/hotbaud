@@ -44,7 +44,7 @@ import trio
 from hotbaud.eventfd import EFD_NONBLOCK, EFD_SEMAPHORE, open_eventfd, read_eventfd, write_eventfd
 
 
-default_set_value = (2 ** 64) - 1
+default_set_value = (2 ** 64) - 2
 
 
 class EventCommon:

@@ -191,6 +191,9 @@ class EventFD:
                             )
 
                 except OSError as e:
+                    if e.errno == errno.EAGAIN:
+                        raise trio.WouldBlock
+
                     if e.errno != errno.EBADF:
                         raise
 

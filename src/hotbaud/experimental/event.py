@@ -99,16 +99,7 @@ class AsyncEvent(EventCommon):
     async def wait(self) -> None:
         self._ensure_unset()
         await trio.lowlevel.wait_readable(self._fd)
-        try:
-            read_eventfd(self._fd)
-
-        except OSError as e:
-            if e.errno == 'EAGAIN':
-                raise trio.WouldBlock
-
-            else:
-                raise
-
+        read_eventfd(self._fd)
         self._is_set = True
 
 

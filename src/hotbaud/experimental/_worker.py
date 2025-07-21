@@ -35,23 +35,23 @@ contains the worker id & all the info necesary on what and how to run the
 partial originally passed to `run_in_worker`.
 
 '''
-
 import os
 import sys
 import logging
 import inspect
 import pkgutil
 
-from typing import Any, Callable, Self
+from typing import Any, AsyncGenerator, Callable, Self
 from logging import Logger
 from functools import partial
-from contextlib import suppress
+from contextlib import asynccontextmanager
 
 import trio
 import trio_asyncio
 import msgspec
 
-from hotbaud._utils import MessageStruct, namespace_for
+from hotbaud._utils import MessageStruct, make_partial, namespace_for
+from hotbaud.memchan._impl import MemoryChannel
 
 # eventualy move hotbaud.experimental.event into hotbaud.event and stop using
 # relative import
@@ -288,3 +288,64 @@ async def run_in_worker(
 
 if __name__ == '__main__':
     worker_main()
+
+
+'''
+Run function in sub-process & setup IPC msg channels
+
+'''
+
+@asynccontextmanager
+async def open_worker(
+    target_fn: partial | Callable,
+    *,
+    root_id: str | None = None,
+    worker_id: str | None = None,
+    config: dict | msgspec.Struct | None,
+    log_setup: Callable[[], None] | None = None,
+    cancel: bool = True,
+    asyncio: bool = False
+) -> AsyncGenerator[MemoryChannel, None]:
+    from hotbaud import open_memory_channel, attach_to_memory_channel
+
+    target_fn = make_partial(target_fn)
+
+    if not worker_id:
+        worker_id = target_fn.func.__name__
+
+    if not root_id:
+        root_id = str(os.getpid())
+
+    full_worker_id = f'{root_id}.{worker_id}'
+
+    async with (
+        open_memory_channel(f'{full_worker_id}.req') as req_token,
+        open_memory_channel(f'{full_worker_id}.res') as res_token,
+        attach_to_memory_channel(res_token, req_token) as chan
+    ):
+        target_fn.keywords.update({
+            'req_token': req_token,
+            'res_token': res_token
+        })
+
+        async with trio.open_nursery() as n:
+            n.start_soon(
+                partial(
+                    run_in_worker,
+                    worker_id=full_worker_id,
+                    task=target_fn,
+                    exit_fd=None,
+                    asyncio=asyncio,
+                    config=config,
+                    log_setup=log_setup,
+                    pass_fds=(
+                        *req_token.fds,
+                        *res_token.fds
+                    )
+                )
+            )
+            yield chan
+            if cancel:
+                n.cancel_scope.cancel()
+
+    return

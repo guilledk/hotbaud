@@ -131,6 +131,9 @@ async def attach_fan_in_receiver(
                     await send.send((idx, msg))
                 await send.send((idx, None))  # sentinel
 
+            except trio.WouldBlock:
+                ...
+
             except trio.ClosedResourceError:
                 ...
 

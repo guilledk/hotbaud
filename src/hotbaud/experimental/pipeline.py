@@ -172,7 +172,7 @@ class PipelineBuilder:
     def stage(
         self,
         sid: str,
-        func: partial | Callable | Awaitable,
+        func: partial | Callable,
         *,
         inputs: str | Sequence[str] | None = None,
         in_size: int = 64 * 1024,

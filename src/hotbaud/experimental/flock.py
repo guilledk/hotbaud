@@ -6,7 +6,7 @@ TODO: docstring
 '''
 import os
 
-from fcntl import flock, LOCK_EX, LOCK_UN, LOCK_NB
+from fcntl import flock, LOCK_EX, LOCK_UN
 
 from pathlib import Path
 
@@ -76,15 +76,16 @@ class Lock(LockCommon):
 class AsyncLock(LockCommon):
     '''
     Same as Lock but using trio async
-    (requires non blocking flag EFD_NONBLOCK on fd open)
 
     '''
     async def acquire(self) -> None:
         if self._locked:
             return
 
-        await trio.lowlevel.wait_readable(self._fd)
-        flock(self._fd, LOCK_EX | LOCK_NB)
+        await trio.to_thread.run_sync(
+            flock, self._fd, LOCK_EX,
+            abandon_on_cancel=True
+        )
         self._locked = True
 
     async def __aenter__(self):

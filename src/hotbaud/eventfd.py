@@ -194,16 +194,7 @@ class EventFD:
                     if e.errno == 'EAGAIN':
                         raise trio.WouldBlock
 
-                    if e.errno != 'EBADF':
-                        raise
-
                     raise trio.BrokenResourceError from e
-
-                except trio.WouldBlock as e:
-                    if self._fobj and not self._fobj.readable():
-                        raise trio.BrokenResourceError from e
-
-                    raise e
 
             if value is None or self._cscope.cancelled_caught:
                 raise EFDReadCancelled

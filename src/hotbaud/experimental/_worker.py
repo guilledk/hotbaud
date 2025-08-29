@@ -35,18 +35,27 @@ contains the worker id & all the info necesary on what and how to run the
 partial originally passed to `run_in_worker`.
 
 '''
-
 import os
+import sys
+import logging
 import inspect
 import pkgutil
 
-from typing import Any, Self
+from typing import Any, AsyncGenerator, Callable, Self
+from logging import Logger
 from functools import partial
+from contextlib import asynccontextmanager
 
 import trio
 import trio_asyncio
+import msgspec
 
-from hotbaud._utils import MessageStruct, namespace_for
+from hotbaud._utils import MessageStruct, make_partial, namespace_for
+from hotbaud.memchan._impl import MemoryChannel
+
+# eventualy move hotbaud.experimental.event into hotbaud.event and stop using
+# relative import
+from .event import Event
 
 
 spec_env_var = 'HOTBAUD_WORKER_SPEC'
@@ -86,7 +95,29 @@ class WorkerSpec(MessageStruct, frozen=True):
 
     id: str
     task: TaskSpec
+    exit_fd: int | None
     asyncio: bool = False
+    config: dict | None = None
+    config_type: str | None = None
+    log_setup: str | None = None
+    env: dict[str, str] | None = None
+
+    def unwrap_config(self) -> dict | msgspec.Struct | None:
+        if not self.config or not self.config_type:
+            return None
+
+        if self.config_type == 'dict':
+            return self.config
+
+        cfg_type = pkgutil.resolve_name(self.config_type)
+        return msgspec.convert(self.config, type=cfg_type)
+
+    def setup_log(self) -> Logger:
+        if self.log_setup:
+            log_setup_fn = pkgutil.resolve_name(self.log_setup)
+            log_setup_fn()
+
+        return logging.getLogger(self.id)
 
 
 def worker_main() -> None:
@@ -111,21 +142,83 @@ def worker_main() -> None:
     # unpack to actual partial
     task = spec.task.to_partial()
 
+    # maybe run user's log setup & get worker logger
+    log = spec.setup_log()
+    task.keywords['log'] = log
+
     # inject worker_id keyword arg from spec id
     task.keywords['worker_id'] = spec.id
 
-    if spec.task.is_async:
-        if not spec.asyncio:
-            trio.run(task)
-        else:
-            trio_asyncio.run(task)
+    # mabye inject config
+    if (config := spec.unwrap_config()):
+        task.keywords['config'] = config
 
-    else:
-        task()
+    # maybe open exit event:
+    # depending on the stage this worker belongs to it might need to wait on
+    # next stage's exit `Event` in order to keep channel resources alive while
+    # next stage hasnt exited, last stage workers dont need to wait so their
+    # exit_fd is None
+    exit_event = None
+    if spec.exit_fd:
+        exit_event = Event(spec.exit_fd)
+
+    log.info('starting...')
+
+    exception_raised = False
+
+    try:
+        # finally run unwrapped user task, choose right runtime based on params
+        if spec.task.is_async:
+            if not spec.asyncio:
+                trio.run(task)
+            else:
+                trio_asyncio.run(task)
+
+        else:
+            task()
+
+    except Exception as e:
+        # on errors we append worker id info and just raise
+        e.add_note(f'with <3 from worker {spec.id}')
+        exception_raised = True
+        raise
+
+    finally:
+        if exit_event and not exception_raised:
+            # this worker belongs to a stage other than the last, wait next
+            # stage's workers to exit before exiting ourselves
+            # attempt waiting on prev stage exit event capture error on failure
+            try:
+                exit_event.wait()
+                log.info('received exit event, stopping...')
+
+            except Exception as e:
+                # failed to wait on exit event, likely broken fd?
+                # just log warning and exit, we dont want to hide any real
+                # errors
+                log.warning(
+                    'failed read on exit event, stopping...',
+                    exc_info=e
+                )
+
+        else:
+            # if we are last step of pipeline we dont need to wait on any exit
+            # event
+            log.info('exiting...')
+
+        logging.shutdown()
 
 
 async def run_in_worker(
-    worker_id: str, task: partial, *, asyncio: bool = False, **kwargs
+    worker_id: str,
+    task: partial,
+    exit_fd: int | None,
+    *,
+    asyncio: bool = False,
+    config: dict | msgspec.Struct | None,
+    log_setup: Callable[[], None] | None,
+    env: dict[str, str] | None,
+    **kwargs
 ) -> None:
     '''
     Run a callable or awaitable (trio or asyncio style) function inside a
@@ -137,31 +230,131 @@ async def run_in_worker(
      value, events etc.
 
     '''
+    config_type: str | None = None
+    config_dict: dict | None = None
+    if config is not None:
+        # pass config dict or struct as well as info to re-build it if its a struct
+        config_type = (
+            'dict'
+            if isinstance(config, dict)
+            else namespace_for(type(config))
+        )
+        config_dict = (
+            config
+            if isinstance(config, dict)
+            else msgspec.to_builtins(config)
+        )
+
+    # also pass namespace of log_setup function if user passed it
+    log_setup_ns: str | None = namespace_for(log_setup) if log_setup else None
+
     # pack everything we need into env var
     spec = WorkerSpec(
-        id=worker_id, task=TaskSpec.from_partial(task), asyncio=asyncio
+        id=worker_id,
+        task=TaskSpec.from_partial(task),
+        exit_fd=exit_fd,
+        config=config_dict,
+        config_type=config_type,
+        asyncio=asyncio,
+        log_setup=log_setup_ns
     )
 
-    env = os.environ.copy()
-    env[spec_env_var] = spec.encode_str()
+    _env = os.environ.copy()
+    if env:
+        _env.update(env)
+
+    _env[spec_env_var] = spec.encode_str()
 
     # spawn the child
     cmd = [
-        # alias for `worker_main` function (defined in pyproject.toml)
-        'hotbaud-worker',
+        sys.executable,
+        '-m',
+        'hotbaud.experimental._worker',
         worker_id,  # just so worker id is shown on process info
     ]
 
-    async with trio.open_nursery() as nursery:
-        process: trio.Process = await nursery.start(
-            partial(trio.run_process, cmd, env=env, **kwargs)
-        )
+    # TODO: pass exit_fd though our own medium (hotbaud._fdshare)
+    if exit_fd is not None:
+        if 'pass_fds' not in kwargs:
+            kwargs['pass_fds'] = []
 
-        # trio.run_process will propagate cancellation & errors
-        try:
-            await process.wait()
+        kwargs['pass_fds'].append(exit_fd)
 
-        finally:
-            # if process still running, attempt best-effort cleanup
-            if process.returncode is None:
-                process.terminate()
+    process: trio.Process = await trio.lowlevel.open_process(
+        cmd, env=_env, **kwargs
+    )
+
+    try:
+        await process.wait()
+
+    finally:
+        # if process still running, attempt best-effort cleanup
+        if process.returncode is None:
+            process.terminate()
+
+
+if __name__ == '__main__':
+    worker_main()
+
+
+'''
+Run function in sub-process & setup IPC msg channels
+
+'''
+
+@asynccontextmanager
+async def open_worker(
+    target_fn: partial | Callable,
+    *,
+    root_id: str | None = None,
+    worker_id: str | None = None,
+    config: dict | msgspec.Struct | None,
+    log_setup: Callable[[], None] | None = None,
+    cancel: bool = True,
+    asyncio: bool = False,
+    env: dict[str, str] | None = None
+) -> AsyncGenerator[MemoryChannel, None]:
+    from hotbaud import open_memory_channel, attach_to_memory_channel
+
+    target_fn = make_partial(target_fn)
+
+    if not worker_id:
+        worker_id = target_fn.func.__name__
+
+    if not root_id:
+        root_id = str(os.getpid())
+
+    full_worker_id = f'{root_id}.{worker_id}'
+
+    async with (
+        open_memory_channel(f'{full_worker_id}.req') as req_token,
+        open_memory_channel(f'{full_worker_id}.res') as res_token,
+        attach_to_memory_channel(res_token, req_token) as chan
+    ):
+        target_fn.keywords.update({
+            'req_token': req_token,
+            'res_token': res_token
+        })
+
+        async with trio.open_nursery() as n:
+            n.start_soon(
+                partial(
+                    run_in_worker,
+                    worker_id=full_worker_id,
+                    task=target_fn,
+                    exit_fd=None,
+                    asyncio=asyncio,
+                    config=config,
+                    log_setup=log_setup,
+                    env=env,
+                    pass_fds=(
+                        *req_token.fds,
+                        *res_token.fds
+                    )
+                )
+            )
+            yield chan
+            if cancel:
+                n.cancel_scope.cancel()
+
+    return

@@ -33,6 +33,6 @@ from ._impl import (
 )
 
 from ._fans import (
-    FanOutSender as FanOutSender,
-    FanInReceiver as FanInReceiver
+    attach_fan_out_sender as attach_fan_out_sender,
+    attach_fan_in_receiver as attach_fan_in_receiver
 )

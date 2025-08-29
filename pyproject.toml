@@ -9,12 +9,10 @@ license = 'MIT'
 dependencies = [
     'cffi>=1.17.1',
     'msgspec>=0.19.0',
+    "psutil>=7.0.0",
     'trio>=0.30.0',
     'trio-asyncio>=0.15.0',
 ]
-
-[project.scripts]
-hotbaud-worker = 'hotbaud.experimental._worker:worker_main'
 
 [tool.hatch.metadata]
 allow-direct-references = true

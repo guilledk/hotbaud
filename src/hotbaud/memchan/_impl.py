@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -22,7 +22,7 @@
 '''
 IPC MemoryChannel implementation
 
-Trying to follow trio semantics as close as posible.
+Trying to follow trio channel semantics as close as posible.
 
 (Linux only atm)
 
@@ -53,95 +53,46 @@ TODO: generalize overrun semantics & make it configurable:
 
 ###
 
-# Allocation:
-
-We allocate a shared memory segment of a specific size using the
-`alloc_memory_channel` function, as well as, three `eventfd(2)` used for
-signaling. This returns an `MCToken` which contains all the necesary info to
-connect to a channel.
-
-The `eventfd(2)`s are all initialized to value 0, and non blocking mode.
-
-# Writer side:
-
-On a separate process or thread we can open the memory channel by using the
-`attach_to_memory_sender` context manager.
-
-Once opened the writer can start placing byte sequences on the shared memory
-segment, respecting the rule that after doing so it must do a write to the
-"writefd" event with the integer parameter being the length of the byte
-sequence written.
-
-Once the writer reaches the end of the buffer it will read from the `wrapfd`
-event, which the reader will use to signal reaching the end of the buffer,
-unblocking the writer which will begin the process all over again starting
-from first index on the shared memory segment.
-
-# Reader side:
-
-On a separate process or thread we can open the memory channel by using the
-`attach_to_memory_receiver` context manager.
-
-Once opened the reader will immediately read from the `writefd` event, which
-can only result in two outcomes:
-
-    - The event counter is 0 (meaning no bytes have been written to the shared
-    segment since last `writefd` read), which will make the kernel block
-    the thread until the counter gets incremented, returning the value,
-    reseting the kernel counter again and unblocking.
-
-    - The event counter was a positive integer, the call will immediately
-    return the counter value, signaling that we can read from last read index
-    until last read index + value. The kernel counter value will be reset to 0
-    after before read return.
-
-Once the reader reaches the end of the buffer, it will reset its read index
-back to 0 & write 1 to the `wrapfd`, which signals to the writer that we are
-ready to "wrap around" and start the process all over again, attempting a new
-read on the `writefd` event.
-
 '''
+
 from __future__ import annotations
 
-import os
+from pathlib import Path
 import sys
 import struct
 import logging
 
-from typing import (
-    AsyncGenerator,
-    TypeVar,
-)
-from contextlib import (
-    asynccontextmanager as acm,
-    suppress
-)
+from typing import Any, AsyncGenerator
+from contextlib import asynccontextmanager as acm, suppress
 from multiprocessing.shared_memory import SharedMemory
 
-import trio
-from trio import socket
+import anyio
+from anyio import get_cancelled_exc_class
+from anyio.abc import AsyncBackend
+from anyio._core._eventloop import get_async_backend
 
 from msgspec.msgpack import (
     Encoder,
     Decoder,
 )
 
+from hotbaud._fdshare import maybe_open_fd_share_socket
 from hotbaud.types import Buffer
 from hotbaud.errors import HotbaudInternalError as InternalError
 from hotbaud.eventfd import (
     EFD_NONBLOCK,
     EFDSyncMethods,
     default_sync_method,
-    open_eventfd,
+    ll_open_eventfd,
     EFDReadCancelled,
-    EventFD
+    EventFD,
 )
 from hotbaud._utils import MessageStruct
-from hotbaud._fdshare import maybe_open_fd_share_socket, recv_fds
 
 
 if sys.version_info.minor < 13:
     from hotbaud._utils import disable_resource_tracker
+
     disable_resource_tracker()
 
 
@@ -156,32 +107,29 @@ class MCToken(MessageStruct, frozen=True):
     MemoryChannel token contains necesary info to open resources of a channel
 
     '''
+
     shm_name: str
 
     write_eventfd: int  # used to signal writer ptr advance
-    wrap_eventfd: int  # used to signal reader ready after wrap around
+    read_eventfd: int  # used to signal reader ptr advance
     eof_eventfd: int  # used to signal writer closed
 
-    buf_size: int  # size in bytes of underlying shared memory buffer
-
-    share_path: str | None
+    buf_size: int  # size in bytes of underlying shared memory Buffer
+    sync_backend: EFDSyncMethods  # method of fd read sync: epoll or thread
+    share_path: str | None = None  # where to request the fds
 
     @property
     def fds(self) -> tuple[int, int, int]:
-        return (
-            self.write_eventfd,
-            self.wrap_eventfd,
-            self.eof_eventfd
-        )
+        return (self.write_eventfd, self.read_eventfd, self.eof_eventfd)
 
 
-async def alloc_memory_channel(
+def alloc_memory_channel(
     shm_name: str,
     *,
     buf_size: int = _DEFAULT_RB_SIZE,
-    share_path: str | None = None,
+    share_path: str | Path | None = None,
     sync_backend: EFDSyncMethods = default_sync_method,
-) -> tuple[SharedMemory, MCToken, socket.SocketType | None]:
+) -> tuple[SharedMemory, MCToken]:
     '''
     Allocate OS resources for a memory channel.
 
@@ -192,10 +140,7 @@ async def alloc_memory_channel(
         extra_kwargs['track'] = False
 
     shm = SharedMemory(
-        name=shm_name,
-        size=buf_size,
-        create=True,
-        **extra_kwargs
+        name=shm_name, size=buf_size, create=True, **extra_kwargs
     )
 
     eventfd_flags = 0
@@ -204,19 +149,15 @@ async def alloc_memory_channel(
 
     token = MCToken(
         shm_name=shm_name,
-        write_eventfd=open_eventfd(flags=eventfd_flags),
-        wrap_eventfd=open_eventfd(flags=eventfd_flags),
-        eof_eventfd=open_eventfd(flags=eventfd_flags),
+        write_eventfd=ll_open_eventfd(flags=eventfd_flags),
+        read_eventfd=ll_open_eventfd(flags=eventfd_flags),
+        eof_eventfd=ll_open_eventfd(flags=eventfd_flags),
         buf_size=buf_size,
-        share_path=share_path
+        share_path=str(share_path) if share_path else None,
+        sync_backend=sync_backend,
     )
-    share_sock = None
-    if share_path:
-        share_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        await share_sock.bind(share_path)
-        share_sock.listen(1)
 
-    return shm, token, share_sock
+    return shm, token
 
 
 @acm
@@ -224,8 +165,8 @@ async def open_memory_channel(
     shm_name: str,
     *,
     buf_size: int = _DEFAULT_RB_SIZE,
-    share_path: str | None = None,
-    sync_backend: EFDSyncMethods = default_sync_method
+    share_path: str | Path | None = None,
+    sync_backend: EFDSyncMethods = default_sync_method,
 ) -> AsyncGenerator[MCToken]:
     '''
     Handle resources for a mem-chan (shm, eventfd, share_sock), yield `MCToken`
@@ -235,15 +176,14 @@ async def open_memory_channel(
     '''
     shm: SharedMemory | None = None
     token: MCToken | None = None
-    sh_sock: socket.SocketType | None = None
     try:
-        shm, token, sh_sock = await alloc_memory_channel(
+        shm, token = alloc_memory_channel(
             shm_name,
             buf_size=buf_size,
             share_path=share_path,
-            sync_backend=sync_backend
+            sync_backend=sync_backend,
         )
-        async with maybe_open_fd_share_socket(sh_sock, token.fds):
+        async with maybe_open_fd_share_socket(token.share_path, token.fds):
             yield token
 
     finally:
@@ -251,16 +191,11 @@ async def open_memory_channel(
             with suppress(Exception):
                 shm.unlink()
 
-        if sh_sock and share_path:
-            with suppress(Exception):
-                sh_sock.close()
-                os.unlink(share_path)
-
 
 '''
 IPC MemoryChannel
 
-`eventfd(2)` is used for wrap around sync, to signal writes to
+`eventfd(2)` is used for read/write pointer sync, to signal writes to
 the reader and end of stream.
 
 In order to guarantee full messages are received, all bytes
@@ -271,48 +206,51 @@ next full payload.
 '''
 
 
-PayloadT = TypeVar('PayloadT')
-
-
-class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
+class MemorySendChannel:
     '''
     Memory channel sender side implementation
 
     Do not use directly! manage with `attach_to_memory_sender`
     after having opened a mem-chan context with `open_memory_channel`.
 
-    Optional batch mode:
-
-    If `batch_size` > 1 messages wont get sent immediately but will be
-    stored until `batch_size` messages are pending, then it will send
-    them all at once.
-
-    `batch_size` can be changed dynamically but always call, `flush()`
-    right before.
-
     '''
+
     def __init__(
         self,
         token: MCToken,
-        batch_size: int = 1,
+        async_backend: type[AsyncBackend],
+        cancel_exc: type[BaseException],
         cleanup: bool = False,
-        encoder: Encoder | None = None
+        encoder: Encoder | None = None,
     ):
         self._token = MCToken.from_msg(token)
-        self.batch_size = batch_size
+        self._cancel_exc = cancel_exc
 
         # mem-chan os resources
         self._shm: SharedMemory | None = None
-        self._write_event = EventFD(self._token.write_eventfd, 'w')
-        self._wrap_event = EventFD(self._token.wrap_eventfd, 'r')
-        self._eof_event = EventFD(self._token.eof_eventfd, 'w')
+        self._write_event = EventFD(
+            fd=self._token.write_eventfd,
+            omode='w',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
+        self._read_event = EventFD(
+            fd=self._token.read_eventfd,
+            omode='r',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
+        self._eof_event = EventFD(
+            fd=self._token.eof_eventfd,
+            omode='w',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
 
         # current write pointer
-        self._ptr: int = 0
-
-        # when `batch_size` > 1 store messages on `self._batch` and write them
-        # all, once `len(self._batch) == `batch_size`
-        self._batch: list[bytes] = []
+        self._wptr: int = 0
+        # current read pointer
+        self._rptr: int = 0
 
         # close shm & fds on exit?
         self._cleanup: bool = cleanup
@@ -324,13 +262,13 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
         self._is_closed: bool = True
 
         # ensure no concurrent `.send_all()` calls
-        self._send_all_lock = trio.StrictFIFOLock()
+        self._send_all_lock = anyio.Lock()
 
         # ensure no concurrent `.send()` calls
-        self._send_lock = trio.StrictFIFOLock()
+        self._send_lock = anyio.Lock()
 
         # ensure no concurrent `.flush()` calls
-        self._flush_lock = trio.StrictFIFOLock()
+        self._flush_lock = anyio.Lock()
 
     @property
     def closed(self) -> bool:
@@ -347,100 +285,68 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
         return self._token.buf_size
 
     @property
-    def ptr(self) -> int:
-        return self._ptr
+    def write_ptr(self) -> int:
+        return self._wptr
+
+    @property
+    def read_ptr(self) -> int:
+        return self._rptr
 
     @property
     def write_fd(self) -> int:
         return self._write_event.fd
 
     @property
-    def wrap_fd(self) -> int:
-        return self._wrap_event.fd
+    def read_fd(self) -> int:
+        return self._read_event.fd
 
-    @property
-    def pending_msgs(self) -> int:
-        return len(self._batch)
-
-    @property
-    def must_flush(self) -> bool:
-        return self.pending_msgs >= self.batch_size
-
-    async def _wait_wrap(self):
-        await self._wrap_event.read()
+    async def _wait_reader(self) -> int:
+        delta = await self._read_event.read()
+        self._rptr += delta
+        return delta
 
     async def send_all(self, data: Buffer):
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._send_all_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError('send_all already in progress')
 
         async with self._send_all_lock:
-            # while data is larger than the remaining buf
-            target_ptr = self.ptr + len(data)
-            while target_ptr > self.size:
-                # write all bytes that fit
-                remaining = self.size - self.ptr
-                self._shm.buf[self.ptr:] = data[:remaining]
-                # signal write and wait for reader wrap around
-                self._write_event.write(remaining)
-                await self._wait_wrap()
+            mv = memoryview(data)
+            off = 0
+            mv_len = len(mv)
+            while off < mv_len:
+                used = self._wptr - self._rptr
+                free = self.size - used
+                if free == 0:
+                    await self._wait_reader()
+                    continue
 
-                # wrap around and trim already written bytes
-                self._ptr = 0
-                data = data[remaining:]
-                target_ptr = self._ptr + len(data)
+                pos = self._wptr % self.size
+                n = min(mv_len - off, free, self.size - pos)
+                self._shm.buf[pos : pos + n] = mv[off : off + n]
+                self._write_event.write(n)
+                self._wptr += n
+                off += n
 
-            # remaining data fits on buffer
-            self._shm.buf[self.ptr:target_ptr] = data
-            self._write_event.write(len(data))
-            self._ptr = target_ptr
-
-    async def wait_send_all_might_not_block(self):
-        return
-
-    async def flush(
-        self,
-        new_batch_size: int | None = None
-    ) -> None:
+    async def send(self, value: Any) -> None:
         if self.closed:
-            raise trio.ClosedResourceError
-
-        async with self._flush_lock:
-            for msg in self._batch:
-                await self.send_all(msg)
-
-            self._batch = []
-            if new_batch_size:
-                self.batch_size = new_batch_size
-
-    async def send(self, value: PayloadT) -> None:
-        if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._send_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError('send already in progress')
 
-        raw_value: bytes = (
-            value
-            if isinstance(value, bytes)
-            else
-            self._enc.encode(value)
-        )
+        if isinstance(value, bytes):
+            raw_value = value
+        else:
+            if not self._enc:
+                raise TypeError('encoder required for non-bytes payloads')
+            raw_value = self._enc.encode(value)
 
         async with self._send_lock:
-            msg: bytes = struct.pack("<I", len(raw_value)) + raw_value
-            if self.batch_size == 1:
-                if len(self._batch) > 0:
-                    await self.flush()
-
-                await self.send_all(msg)
-                return
-
-            self._batch.append(msg)
-            if self.must_flush:
-                await self.flush()
+            msg: bytes = struct.pack('<I', len(raw_value)) + raw_value
+            await self.send_all(msg)
 
     def open(self):
         try:
@@ -452,10 +358,10 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
                 name=self._token.shm_name,
                 size=self._token.buf_size,
                 create=False,
-                **extra_kwargs
+                **extra_kwargs,
             )
             self._write_event.open()
-            self._wrap_event.open()
+            self._read_event.open()
             self._eof_event.open()
             self._is_closed = False
 
@@ -464,15 +370,17 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
             raise e
 
     def _close(self):
-        self._eof_event.write(
-            self._ptr if self._ptr > 0 else self.size
-        )
+        # ensure EOF write always wakes up the reader even when no bytes writen
+        # thats why we add 1
+        self._eof_event.write(self._wptr + 1)
 
         if self._cleanup:
             self._write_event.close()
-            self._wrap_event.close()
+            self._read_event.close()
             self._eof_event.close()
-            self._shm.close()
+
+            if self._shm is not None:
+                self._shm.close()
 
         self._is_closed = True
 
@@ -482,12 +390,8 @@ class MemorySendChannel(trio.abc.SendChannel[PayloadT]):
 
         self._close()
 
-    async def __aenter__(self):
-        self.open()
-        return self
 
-
-class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
+class MemoryReceiveChannel:
     '''
     Memory channel receiver side implementation
 
@@ -495,28 +399,47 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
     after having opened a mem-chan context with `open_memory_channel`.
 
     '''
+
     def __init__(
         self,
         token: MCToken,
+        async_backend: type[AsyncBackend],
+        cancel_exc: type[BaseException],
         cleanup: bool = False,
-        decoder: Decoder | None = None
+        decoder: Decoder | None = None,
     ):
         self._token = MCToken.from_msg(token)
+        self._cancel_exc = cancel_exc
 
         # mem-chan os resources
         self._shm: SharedMemory | None = None
-        self._write_event = EventFD(self._token.write_eventfd, 'w')
-        self._wrap_event = EventFD(self._token.wrap_eventfd, 'r')
-        self._eof_event = EventFD(self._token.eof_eventfd, 'r')
+        self._write_event = EventFD(
+            fd=self._token.write_eventfd,
+            omode='r',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
+        self._read_event = EventFD(
+            fd=self._token.read_eventfd,
+            omode='w',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
+        self._eof_event = EventFD(
+            fd=self._token.eof_eventfd,
+            omode='r',
+            sync_backend=token.sync_backend,
+            async_backend=async_backend,
+        )
+
+        # current write ptr
+        self._wptr: int = 0
 
         # current read ptr
-        self._ptr: int = 0
+        self._rptr: int = 0
 
-        # current write_ptr (max bytes we can read from buf)
-        self._write_ptr: int = 0
-
-        # end ptr is used when EOF is signaled, it will contain maximun
-        # readable position on buf
+        # end ptr is used when EOF is signaled; contains maximum
+        # readable position in absolute pointer space
         self._end_ptr: int = -1
 
         # close shm & fds on exit?
@@ -529,13 +452,13 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
         self._dec: Decoder | None = decoder
 
         # ensure no concurrent `.receive_some()` calls
-        self._receive_some_lock = trio.StrictFIFOLock()
+        self._receive_some_lock = anyio.Lock()
 
         # ensure no concurrent `.receive_exactly()` calls
-        self._receive_exactly_lock = trio.StrictFIFOLock()
+        self._receive_exactly_lock = anyio.Lock()
 
         # ensure no concurrent `.receive()` calls
-        self._receive_lock = trio.StrictFIFOLock()
+        self._receive_lock = anyio.Lock()
 
     @property
     def closed(self) -> bool:
@@ -552,16 +475,20 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
         return self._token.buf_size
 
     @property
-    def ptr(self) -> int:
-        return self._ptr
+    def write_ptr(self) -> int:
+        return self._wptr
+
+    @property
+    def read_ptr(self) -> int:
+        return self._rptr
 
     @property
     def write_fd(self) -> int:
         return self._write_event.fd
 
     @property
-    def wrap_fd(self) -> int:
-        return self._wrap_event.fd
+    def read_fd(self) -> int:
+        return self._read_event.fd
 
     @property
     def eof_was_signaled(self) -> bool:
@@ -578,12 +505,13 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
         '''
         try:
-            self._end_ptr = await self._eof_event.read()
+            v = await self._eof_event.read()
+            self._end_ptr = max(0, v - 1)
 
         except EFDReadCancelled:
             ...
 
-        except trio.Cancelled:
+        except self._cancel_exc:
             ...
 
         finally:
@@ -594,43 +522,33 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
     def receive_nowait(self, max_bytes: int = _DEFAULT_RB_SIZE) -> bytes:
         '''
         Try to receive any bytes we can without blocking or raise
-        `trio.WouldBlock`.
+        `anyio.WouldBlock`.
 
         Returns b'' when no more bytes can be read (EOF signaled & read all).
 
         '''
         if max_bytes < 1:
-            raise ValueError("max_bytes must be >= 1")
+            raise ValueError('max_bytes must be >= 1')
 
-        # in case `end_ptr` is set that means eof was signaled.
-        # it will be >= `write_ptr`, use it for delta calc
-        highest_ptr = max(self._write_ptr, self._end_ptr)
-
-        delta = highest_ptr - self._ptr
+        # available = produced - consumed (seq space)
+        highest = max(self._wptr, self._end_ptr)
+        delta = highest - self._rptr
 
         # no more bytes to read
         if delta == 0:
-            # if `end_ptr` is set that means we read all bytes before EOF
+            # EOF and nothing left
             if self.eof_was_signaled:
                 return b''
 
             # signal the need to wait on `write_event`
-            raise trio.WouldBlock
+            raise anyio.WouldBlock
 
-        # dont overflow caller
         delta = min(delta, max_bytes)
-
-        target_ptr = self._ptr + delta
-
-        # fetch next segment and advance ptr
-        segment = bytes(self._shm.buf[self._ptr:target_ptr])
-        self._ptr = target_ptr
-
-        if self._ptr == self.size:
-            # reached the end, signal wrap around
-            self._ptr = 0
-            self._write_ptr = 0
-            self._wrap_event.write(1)
+        pos = self._rptr % self.size
+        n = min(delta, self.size - pos)
+        segment = bytes(self._shm.buf[pos : pos + n])
+        self._rptr += n
+        self._read_event.write(n)
 
         return segment
 
@@ -643,50 +561,36 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
         '''
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._receive_some_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError('receive_some in progress')
 
         async with self._receive_some_lock:
-            try:
-                # attempt direct read
-                return self.receive_nowait(max_bytes=max_bytes)
+            while True:
+                try:
+                    return self.receive_nowait(max_bytes=max_bytes)
 
-            except trio.WouldBlock as e:
-                # we have read all we can, see if new data is available
-                if not self.eof_was_signaled:
-                    # if we havent been signaled about EOF yet
+                except anyio.WouldBlock as e:
+                    if self.eof_was_signaled:
+                        raise InternalError(
+                            'eof set but receive_nowait raised WouldBlock'
+                        ) from e
+
                     try:
-                        # wait next write and advance `write_ptr`
                         delta = await self._write_event.read()
-                        self._write_ptr += delta
-                        # yield lock and re-enter
+                        self._wptr += delta
 
                     except (
-                        EFDReadCancelled,  # read was cancelled with cscope
-                        trio.Cancelled,  # read got cancelled from outside
-                        trio.BrokenResourceError  # OSError EBADF happened while reading
+                        EFDReadCancelled,
+                        self._cancel_exc,
+                        anyio.BrokenResourceError,
                     ):
-                        # while waiting for new data `self._write_event` was closed
                         try:
-                            # if eof was signaled receive no wait will not raise
-                            # trio.WouldBlock and will push remaining until EOF
                             return self.receive_nowait(max_bytes=max_bytes)
 
-                        except trio.WouldBlock:
-                            # eof was not signaled but `self._wrap_event` is closed
-                            # this means send side closed without EOF signal
+                        except anyio.WouldBlock:
                             return b''
-
-                else:
-                    # shouldnt happen because receive_nowait does not raise
-                    # trio.WouldBlock when `end_ptr` is set
-                    raise InternalError(
-                        'self._end_ptr is set but receive_nowait raised trio.WouldBlock'
-                    ) from e
-
-        return await self.receive_some(max_bytes=max_bytes)
 
     async def receive_exactly(self, num_bytes: int) -> bytes:
         '''
@@ -694,68 +598,69 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
         '''
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._receive_exactly_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError('receive-exactly')
 
         async with self._receive_exactly_lock:
-            payload = b''
-            while len(payload) < num_bytes:
-                remaining = num_bytes - len(payload)
+            buf = bytearray()
 
-                new_bytes = await self.receive_some(
-                    max_bytes=remaining
-                )
-
+            while len(buf) < num_bytes:
+                remaining = num_bytes - len(buf)
+                new_bytes = await self.receive_some(max_bytes=remaining)
                 if new_bytes == b'':
                     break
+                buf.extend(new_bytes)
 
-                payload += new_bytes
+            if len(buf) != num_bytes:
+                raise anyio.EndOfStream
 
-            if payload == b'':
-                raise trio.EndOfChannel
+            return bytes(buf)
 
-            return payload
-
-    async def receive(self, raw: bool = False) -> PayloadT:
+    async def receive(self, raw: bool = False) -> Any:
         '''
         Receive a complete payload or raise EOC
 
         '''
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._receive_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError('receive')
 
         async with self._receive_lock:
             header: bytes = await self.receive_exactly(4)
             size: int
-            size, = struct.unpack("<I", header)
+            (size,) = struct.unpack('<I', header)
             if size == 0:
-                raise trio.EndOfChannel
+                raise anyio.EndOfStream
 
             raw_msg = await self.receive_exactly(size)
             if raw:
                 return raw_msg
 
-            return (
-                raw_msg
-                if not self._dec
-                else self._dec.decode(raw_msg)
-            )
+            return raw_msg if not self._dec else self._dec.decode(raw_msg)
 
-    async def iter_raw_pairs(self) -> tuple[bytes, PayloadT]:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self.receive(raw=True)
+        except (anyio.EndOfStream, anyio.ClosedResourceError):
+            raise StopAsyncIteration
+
+    async def iter_raw_pairs(self) -> AsyncGenerator[tuple[bytes, Any], None]:
         if not self._dec:
-            raise RuntimeError('iter_raw_pair requires decoder')
+            raise RuntimeError('iter_raw_pairs requires decoder')
 
         while True:
             try:
                 raw = await self.receive(raw=True)
                 yield raw, self._dec.decode(raw)
 
-            except trio.EndOfChannel:
+            except anyio.EndOfStream:
                 break
 
     def open(self):
@@ -768,10 +673,10 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
                 name=self._token.shm_name,
                 size=self._token.buf_size,
                 create=False,
-                **extra_kwargs
+                **extra_kwargs,
             )
             self._write_event.open()
-            self._wrap_event.open()
+            self._read_event.open()
             self._eof_event.open()
             self._is_closed = False
 
@@ -782,9 +687,11 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
     def close(self):
         if self._cleanup:
             self._write_event.close()
-            self._wrap_event.close()
+            self._read_event.close()
             self._eof_event.close()
-            self._shm.close()
+
+            if self._shm is not None:
+                self._shm.close()
 
         self._is_closed = True
 
@@ -794,63 +701,63 @@ class MemoryReceiveChannel(trio.abc.ReceiveChannel[PayloadT]):
 
         self.close()
 
-    async def __aenter__(self):
-        self.open()
-        return self
+
+async def maybe_negotiate_token(token: MCToken) -> MCToken:
+    if not token.share_path:
+        return token
+
+    async with await anyio.connect_unix(token.share_path) as sock:
+        _, fds = await sock.receive_fds(0, len(token.fds))
+        write_fd, read_fd, eof_fd = fds
+        return MCToken(
+            shm_name=token.shm_name,
+            write_eventfd=write_fd,
+            read_eventfd=read_fd,
+            eof_eventfd=eof_fd,
+            buf_size=token.buf_size,
+            sync_backend=token.sync_backend,
+            share_path=token.share_path,
+        )
 
 
 @acm
 async def attach_to_memory_receiver(
-
     token: MCToken | dict,
     *,
     cleanup: bool = False,
     decoder: Decoder | None = None,
-
 ) -> AsyncGenerator[MemoryReceiveChannel, None]:
     '''
     Attach a `MemoryReceiveChannel` from a previously opened
     MCToken.
 
-    Launches `receiver._eof_monitor_task` in a `trio.Nursery`.
+    Launches `receiver._eof_monitor_task` in a `anyio.TaskGroup`.
 
     '''
     token = MCToken.from_msg(token)
+    token = await maybe_negotiate_token(token)
 
-    if token.share_path:
-        write, wrap, eof = await recv_fds(token.share_path, 3)
-        token = MCToken(
-            shm_name=token.shm_name,
-            write_eventfd=write,
-            wrap_eventfd=wrap,
-            eof_eventfd=eof,
-            buf_size=token.buf_size,
-            share_path=token.share_path
-        )
-        log.info(f'received fds from {token.share_path}')
-
-    async with (
-        trio.open_nursery() as n,
-        MemoryReceiveChannel(
+    async with anyio.create_task_group() as g:
+        receiver = MemoryReceiveChannel(
             token,
+            async_backend=get_async_backend(),
+            cancel_exc=get_cancelled_exc_class(),
             cleanup=cleanup,
-            decoder=decoder
-        ) as receiver
-    ):
-        n.start_soon(receiver._eof_monitor_task)
+            decoder=decoder,
+        )
+        receiver.open()
+        g.start_soon(receiver._eof_monitor_task)
         yield receiver
-        n.cancel_scope.cancel()
+        g.cancel_scope.cancel()
+        receiver.close()
 
 
 @acm
 async def attach_to_memory_sender(
-
     token: MCToken | dict,
     *,
-    batch_size: int = 1,
     cleanup: bool = False,
     encoder: Encoder | None = None,
-
 ) -> AsyncGenerator[MemorySendChannel, None]:
     '''
     Attach a `MemorySendChannel` from a previously opened
@@ -858,65 +765,35 @@ async def attach_to_memory_sender(
 
     '''
     token = MCToken.from_msg(token)
+    token = await maybe_negotiate_token(token)
 
-    if token.share_path:
-        write, wrap, eof = await recv_fds(token.share_path, 3)
-        token = MCToken(
-            shm_name=token.shm_name,
-            write_eventfd=write,
-            wrap_eventfd=wrap,
-            eof_eventfd=eof,
-            buf_size=token.buf_size,
-            share_path=token.share_path
-        )
-        log.info(f'received fds from {token.share_path}')
-
-    async with MemorySendChannel(
+    sender = MemorySendChannel(
         token,
-        batch_size=batch_size,
+        async_backend=get_async_backend(),
+        cancel_exc=get_cancelled_exc_class(),
         cleanup=cleanup,
-        encoder=encoder
-    ) as sender:
-        yield sender
+        encoder=encoder,
+    )
+    sender.open()
+    yield sender
+    await sender.aclose()
 
 
-class MemoryChannel(trio.abc.Channel[bytes]):
+class MemoryChannel:
     '''
     Combine `MemorySendChannel` and `MemoryReceiveChannel`
-    in order to expose the bidirectional `trio.abc.Channel` API.
+    in order to expose the bidirectional  API.
 
     '''
+
     def __init__(
-        self,
-        sender: MemorySendChannel,
-        receiver: MemoryReceiveChannel
+        self, sender: MemorySendChannel, receiver: MemoryReceiveChannel
     ):
         self._sender = sender
         self._receiver = receiver
 
-    @property
-    def batch_size(self) -> int:
-        return self._sender.batch_size
-
-    @batch_size.setter
-    def batch_size(self, value: int) -> None:
-        self._sender.batch_size = value
-
-    @property
-    def pending_msgs(self) -> int:
-        return self._sender.pending_msgs
-
     async def send_all(self, value: bytes) -> None:
         await self._sender.send_all(value)
-
-    async def wait_send_all_might_not_block(self):
-        await self._sender.wait_send_all_might_not_block()
-
-    async def flush(
-        self,
-        new_batch_size: int | None = None
-    ) -> None:
-        await self._sender.flush(new_batch_size=new_batch_size)
 
     async def send(self, value: bytes) -> None:
         await self._sender.send(value)
@@ -943,7 +820,6 @@ async def attach_to_memory_channel(
     token_in: MCToken | dict,
     token_out: MCToken | dict,
     *,
-    batch_size: int = 1,
     cleanup_in: bool = False,
     cleanup_out: bool = False,
     encoder: Encoder | None = None,
@@ -961,7 +837,6 @@ async def attach_to_memory_channel(
         ) as receiver,
         attach_to_memory_sender(
             token_out,
-            batch_size=batch_size,
             cleanup=cleanup_out,
             encoder=encoder,
         ) as sender,

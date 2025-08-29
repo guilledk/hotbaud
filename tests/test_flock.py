@@ -8,8 +8,8 @@ from hotbaud.experimental.flock import Lock, AsyncLock
 
 
 def tmp_lock_path(tmp_path_factory):
-    """Return a unique path for each test without touching /tmp directly."""
-    return tmp_path_factory.mktemp("locks") / "lockfile"
+    '''Return a unique path for each test without touching /tmp directly.'''
+    return tmp_path_factory.mktemp('locks') / 'lockfile'
 
 
 def test_lock_basic(tmp_path_factory):
@@ -23,13 +23,12 @@ def test_lock_basic(tmp_path_factory):
     assert l.locked is False  # released on __exit__
 
 
-async def test_async_lock_basic(tmp_path_factory):
+async def test_async_lock_basic(anyio_backend, tmp_path_factory):
     path = tmp_lock_path(tmp_path_factory)
 
     async with AsyncLock(path) as l:
         assert l.locked is True
     assert l.locked is False
-
 
 
 def test_lock_reentry_and_double_release(tmp_path_factory):
@@ -47,13 +46,15 @@ def test_lock_reentry_and_double_release(tmp_path_factory):
     lock._close()
 
 
-async def test_async_lock_reentry_and_double_release(tmp_path_factory):
+async def test_async_lock_reentry_and_double_release(
+    anyio_backend, tmp_path_factory
+):
     path = tmp_lock_path(tmp_path_factory)
     lock = AsyncLock(path)
     lock._open()
 
-    await lock.acquire()
-    await lock.acquire()
+    await lock.acquire_async()
+    await lock.acquire_async()
     lock.release()
 
     with pytest.raises(RuntimeError):
@@ -81,7 +82,9 @@ def test_lock_blocks_until_released(tmp_path_factory):
 
     t1 = threading.Thread(target=holder, daemon=True)
     t2 = threading.Thread(target=contender, daemon=True)
-    t1.start(); t2.start()
-    t1.join();  t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     assert waited and waited[0] >= delay * 0.9

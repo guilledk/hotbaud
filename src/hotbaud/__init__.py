@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,13 +19,11 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from .types import (
-    Buffer as Buffer,
-    SharedMemory as SharedMemory
-)
+from .types import Buffer as Buffer, SharedMemory as SharedMemory
 from .eventfd import (
     EFDReadCancelled as EFDReadCancelled,
-    EventFD as EventFD
+    EventFD as EventFD,
+    open_eventfd as open_eventfd,
 )
 
 from .memchan import (
@@ -38,5 +36,5 @@ from .memchan import (
     attach_to_memory_receiver as attach_to_memory_receiver,
     attach_to_memory_sender as attach_to_memory_sender,
     MemoryChannel as MemoryChannel,
-    attach_to_memory_channel as attach_to_memory_channel
+    attach_to_memory_channel as attach_to_memory_channel,
 )

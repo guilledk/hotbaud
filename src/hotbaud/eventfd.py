@@ -191,10 +191,10 @@ class EventFD:
                             )
 
                 except OSError as e:
-                    if e.errno != errno.EBADF:
-                        raise
+                    if e.errno == 'EAGAIN':
+                        raise trio.WouldBlock
 
-                    raise trio.BrokenResourceError
+                    raise trio.BrokenResourceError from e
 
             if value is None or self._cscope.cancelled_caught:
                 raise EFDReadCancelled

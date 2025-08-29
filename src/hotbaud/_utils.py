@@ -23,12 +23,19 @@
 Misc utils that don't deserve their own module (yet)
 
 '''
+from contextlib import contextmanager
+
+import os
+import threading
+import time
+import signal
 import inspect
 
 from types import ModuleType
 from typing import Any, Self
 from functools import partial
 
+import psutil
 import msgspec
 
 from hotbaud.types import Buffer
@@ -212,3 +219,40 @@ def namespace_for(obj: Any) -> str:
     qual = getattr(obj, '__qualname__', obj.__name__)
 
     return f'{mod.__name__}:{qual}'  # e.g. 'pathlib:Path.home'
+
+
+@contextmanager
+def oom_self_reaper(kill_at_pct: float = 0.7):
+    '''
+    Ensure the process doesnt eat up all memory
+
+    Launched a bg thread that kills the entire process group if more than
+    `kill_at_pct` of system memory is consumed by the process.
+
+    '''
+    # compute absolute RSS limit (kill_at_pct% of total RAM)
+    limit = int(psutil.virtual_memory().total * kill_at_pct)
+    # ensure we’re the leader of our own process‐group
+    os.setsid()
+
+    def watchdog():
+        me = psutil.Process(os.getpid())
+        while True:
+            try:
+                mem = me.memory_info().rss
+                if mem > limit:
+                    # kill the entire group we created above
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
+                    print(
+                        'process group killed by cap_memory fixture!\n'
+                        f'had {mem:,} bytes in use and configured limit is '
+                        f'{limit:,} bytes'
+                    )
+                time.sleep(0.1)
+            except Exception:
+                break
+
+    # start background monitor thread (daemon so it dies with the process)
+    t = threading.Thread(target=watchdog, daemon=True)
+    t.start()
+    yield

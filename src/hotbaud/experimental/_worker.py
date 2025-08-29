@@ -100,6 +100,7 @@ class WorkerSpec(MessageStruct, frozen=True):
     config: dict | None = None
     config_type: str | None = None
     log_setup: str | None = None
+    env: dict[str, str] | None = None
 
     def unwrap_config(self) -> dict | msgspec.Struct | None:
         if not self.config or not self.config_type:
@@ -205,6 +206,8 @@ def worker_main() -> None:
             # event
             log.info('exiting...')
 
+        logging.shutdown()
+
 
 async def run_in_worker(
     worker_id: str,
@@ -214,6 +217,7 @@ async def run_in_worker(
     asyncio: bool = False,
     config: dict | msgspec.Struct | None,
     log_setup: Callable[[], None] | None,
+    env: dict[str, str] | None,
     **kwargs
 ) -> None:
     '''
@@ -255,8 +259,11 @@ async def run_in_worker(
         log_setup=log_setup_ns
     )
 
-    env = os.environ.copy()
-    env[spec_env_var] = spec.encode_str()
+    _env = os.environ.copy()
+    if env:
+        _env.update(env)
+
+    _env[spec_env_var] = spec.encode_str()
 
     # spawn the child
     cmd = [
@@ -274,7 +281,7 @@ async def run_in_worker(
         kwargs['pass_fds'].append(exit_fd)
 
     process: trio.Process = await trio.lowlevel.open_process(
-        cmd, env=env, **kwargs
+        cmd, env=_env, **kwargs
     )
 
     try:
@@ -304,7 +311,8 @@ async def open_worker(
     config: dict | msgspec.Struct | None,
     log_setup: Callable[[], None] | None = None,
     cancel: bool = True,
-    asyncio: bool = False
+    asyncio: bool = False,
+    env: dict[str, str] | None = None
 ) -> AsyncGenerator[MemoryChannel, None]:
     from hotbaud import open_memory_channel, attach_to_memory_channel
 
@@ -338,6 +346,7 @@ async def open_worker(
                     asyncio=asyncio,
                     config=config,
                     log_setup=log_setup,
+                    env=env,
                     pass_fds=(
                         *req_token.fds,
                         *res_token.fds

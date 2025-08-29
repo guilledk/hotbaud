@@ -830,7 +830,7 @@ async def attach_to_memory_receiver(
         log.info(f'received fds from {token.share_path}')
 
     async with (
-        trio.open_nursery(strict_exception_groups=False) as n,
+        trio.open_nursery() as n,
         MemoryReceiveChannel(
             token,
             cleanup=cleanup,
@@ -839,6 +839,7 @@ async def attach_to_memory_receiver(
     ):
         n.start_soon(receiver._eof_monitor_task)
         yield receiver
+        n.cancel_scope.cancel()
 
 
 @acm

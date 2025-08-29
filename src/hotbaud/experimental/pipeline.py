@@ -54,7 +54,7 @@ from hotbaud.memchan import (
     alloc_memory_channel,
 )
 
-from hotbaud._utils import make_partial
+from hotbaud._utils import make_partial, oom_self_reaper
 from hotbaud._fdshare import open_fd_share_socket
 
 from hotbaud.experimental._worker import run_in_worker
@@ -459,7 +459,8 @@ class WorkerSpawnFn(Protocol):
         *,
         asyncio: bool,
         config: dict | msgspec.Struct | None,
-        log_setup: Callable[[], None] | None
+        log_setup: Callable[[], None] | None,
+        env: dict[str, str] | None
     ) -> Awaitable[Any]: ...
 
 
@@ -527,7 +528,8 @@ class Pipeline:
                         exit_event.fd if exit_event else None,
                         asyncio=w.stage.asyncio,
                         config=self.global_config,
-                        log_setup=self.log_setup
+                        log_setup=self.log_setup,
+                        env=None
                     )
                 )
 
@@ -545,44 +547,50 @@ class Pipeline:
             except Exception as e:
                 log.warning(f'while setting stage {stage.id} (index: {idx}) exit event', exc_info=e)
 
-    async def run(self, *, spawn_fn: WorkerSpawnFn = run_in_worker) -> None:
+    async def run(
+        self,
+        *,
+        spawn_fn: WorkerSpawnFn = run_in_worker,
+        oom_reap_pct: float = .9
+    ) -> None:
         '''
         Long running pipeline task.
 
         Start all fdshare tasks for channels that need it, then spawn stages
 
         '''
-        async with trio.open_nursery() as nursery:
-            # channels with .token.share_path need a task spawned to open the
-            # socket and pass the fds to clients
-            for c in self.channels.values():
-                assert c.token, 'Expected {c.name} to have token at this point'
-                if c.token.share_path:
-                    nursery.start_soon(c.fdshare_task)
+        with oom_self_reaper(kill_at_pct=oom_reap_pct):
+            async with trio.open_nursery() as nursery:
+                # channels with .token.share_path need a task spawned to open the
+                # socket and pass the fds to clients
+                for c in self.channels.values():
+                    assert c.token, 'Expected {c.name} to have token at this point'
+                    if c.token.share_path:
+                        nursery.start_soon(c.fdshare_task)
 
-            # use an inner nursery in order to have separate task scopes for
-            # stage tasks & fd share tasks
-            async with trio.open_nursery() as stage_nursery:
-                # spawn all workers
-                for s in self.stages:
-                    await stage_nursery.start(
-                        partial(
-                            self.run_stage,
-                            s,
-                            spawn_fn=spawn_fn
+                # use an inner nursery in order to have separate task scopes for
+                # stage tasks & fd share tasks
+                async with trio.open_nursery() as stage_nursery:
+                    # spawn all workers
+                    for s in self.stages:
+                        await stage_nursery.start(
+                            partial(
+                                self.run_stage,
+                                s,
+                                spawn_fn=spawn_fn
+                            )
                         )
+
+                    log.info(
+                        f'pipeline {self.pipe_id} started with '
+                        f'{len(self.workers)} workers across '
+                        f'{len(self.stages)} stages'
                     )
 
-                log.info(
-                    f'pipeline {self.pipe_id} started with '
-                    f'{len(self.workers)} workers across '
-                    f'{len(self.stages)} stages'
-                )
+                    # trio will now block on this scope until all stage tasks return
 
-                # trio will now block on this scope until all stage tasks return
-
-            # cancel fd share tasks
-            nursery.cancel_scope.cancel()
+                # cancel fd share tasks
+                nursery.cancel_scope.cancel()
 
     async def __aenter__(self):
         return self

@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,6 +23,7 @@
 Misc utils that don't deserve their own module (yet)
 
 '''
+
 from contextlib import contextmanager
 
 import os
@@ -46,6 +47,7 @@ class MessageStruct(msgspec.Struct, frozen=True):
     Base msgspec struct with some common conversion helpers
 
     '''
+
     @classmethod
     def from_msg(cls, msg: dict | Self) -> Self:
         if isinstance(msg, cls):
@@ -221,6 +223,9 @@ def namespace_for(obj: Any) -> str:
     return f'{mod.__name__}:{qual}'  # e.g. 'pathlib:Path.home'
 
 
+_reaper_enabled = False
+
+
 @contextmanager
 def oom_self_reaper(kill_at_pct: float = 0.7):
     '''
@@ -230,6 +235,11 @@ def oom_self_reaper(kill_at_pct: float = 0.7):
     `kill_at_pct` of system memory is consumed by the process.
 
     '''
+    global _reaper_enabled
+    if _reaper_enabled:
+        yield
+        return
+
     # compute absolute RSS limit (kill_at_pct% of total RAM)
     limit = int(psutil.virtual_memory().total * kill_at_pct)
     # ensure we’re the leader of our own process‐group
@@ -253,6 +263,7 @@ def oom_self_reaper(kill_at_pct: float = 0.7):
                 break
 
     # start background monitor thread (daemon so it dies with the process)
+    _reaper_enabled = True
     t = threading.Thread(target=watchdog, daemon=True)
     t.start()
     yield

@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,10 +29,10 @@ from ._impl import (
     attach_to_memory_receiver as attach_to_memory_receiver,
     attach_to_memory_sender as attach_to_memory_sender,
     MemoryChannel as MemoryChannel,
-    attach_to_memory_channel as attach_to_memory_channel
+    attach_to_memory_channel as attach_to_memory_channel,
 )
 
 from ._fans import (
     attach_fan_out_sender as attach_fan_out_sender,
-    attach_fan_in_receiver as attach_fan_in_receiver
+    attach_fan_in_receiver as attach_fan_in_receiver,
 )

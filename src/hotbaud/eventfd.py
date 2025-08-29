@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,12 +23,17 @@
 Expose libc eventfd APIs
 
 '''
+
+from contextlib import asynccontextmanager
 import os
 import errno
-from typing import Literal
+from typing import AsyncGenerator, Literal
 
+from anyio.abc import AsyncBackend
 import cffi
-import trio
+import anyio
+
+from anyio._core._eventloop import get_async_backend
 
 ffi = cffi.FFI()
 
@@ -59,7 +64,7 @@ EFD_CLOEXEC = 0o2000000
 EFD_NONBLOCK = 0o4000
 
 
-def open_eventfd(initval: int = 0, flags: int = 0) -> int:
+def ll_open_eventfd(initval: int = 0, flags: int = 0) -> int:
     '''
     Open an eventfd with the given initial value and flags.
     Returns the file descriptor on success, otherwise raises OSError.
@@ -71,7 +76,7 @@ def open_eventfd(initval: int = 0, flags: int = 0) -> int:
     return fd
 
 
-def write_eventfd(fd: int, value: int) -> int:
+def ll_write_eventfd(fd: int, value: int) -> int:
     '''
     Write a 64-bit integer (uint64_t) to the eventfd's counter.
 
@@ -87,7 +92,7 @@ def write_eventfd(fd: int, value: int) -> int:
     return ret
 
 
-def read_eventfd(fd: int) -> int:
+def ll_read_eventfd(fd: int) -> int:
     '''
     Read a 64-bit integer (uint64_t) from the eventfd, returning the value.
     Reading resets the counter to 0 (unless using EFD_SEMAPHORE).
@@ -105,7 +110,7 @@ def read_eventfd(fd: int) -> int:
     return value
 
 
-def close_eventfd(fd: int) -> int:
+def ll_close_eventfd(fd: int) -> int:
     '''
     Close the eventfd.
 
@@ -116,12 +121,12 @@ def close_eventfd(fd: int) -> int:
 
 
 EFDSyncMethods = Literal['epoll', 'thread']
+EFDOpenMode = Literal['r', 'w', 'rw']
 
 default_sync_method: EFDSyncMethods = 'epoll'
 
 
-class EFDReadCancelled(Exception):
-    ...
+class EFDReadCancelled(Exception): ...
 
 
 class EventFD:
@@ -135,15 +140,18 @@ class EventFD:
     def __init__(
         self,
         fd: int,
-        omode: str,
-        sync_backend: EFDSyncMethods = default_sync_method
+        omode: EFDOpenMode,
+        sync_backend: EFDSyncMethods,
+        async_backend: type[AsyncBackend],
     ):
         self._fd: int = fd
         self._omode: str = omode
-        self._fobj = None
-        self._cscope: trio.CancelScope | None = None
+        self._cscope: anyio.CancelScope | None = None
         self._is_closed: bool = True
-        self._read_lock = trio.StrictFIFOLock()
+        self._read_lock = anyio.Lock()
+
+        self._async_backend = async_backend
+
         self.sync_backend = sync_backend
 
     @property
@@ -151,50 +159,48 @@ class EventFD:
         return self._is_closed
 
     @property
-    def fd(self) -> int | None:
+    def fd(self) -> int:
         return self._fd
 
     def write(self, value: int) -> int:
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
-        return write_eventfd(self._fd, value)
+        return ll_write_eventfd(self._fd, value)
 
     async def read(self) -> int:
         '''
         Async wrapper for `read_eventfd(self.fd)`
 
-        `trio.to_thread.run_sync` is used, need to use a `trio.CancelScope`
-        in order to make it cancellable when `self.close()` is called.
-
         '''
         if self.closed:
-            raise trio.ClosedResourceError
+            raise anyio.ClosedResourceError
 
         if self._read_lock.locked():
-            raise trio.BusyResourceError
+            raise anyio.BusyResourceError(action='reading')
 
         async with self._read_lock:
             value: int | None = None
-            self._cscope = trio.CancelScope()
+            self._cscope = anyio.CancelScope()
             with self._cscope:
                 try:
                     match self.sync_backend:
                         case 'epoll':
-                            await trio.lowlevel.wait_readable(self._fd)
+                            await self._async_backend.wait_readable(self._fd)
                             value = self.read_nowait()
 
                         case 'thread':
-                            return await trio.to_thread.run_sync(
-                                read_eventfd, self._fd,
-                                abandon_on_cancel=True
+                            return await anyio.to_thread.run_sync(
+                                ll_read_eventfd,
+                                self._fd,
+                                abandon_on_cancel=True,
                             )
 
                 except OSError as e:
                     if e.errno == 'EAGAIN':
-                        raise trio.WouldBlock
+                        raise anyio.WouldBlock
 
-                    raise trio.BrokenResourceError from e
+                    raise anyio.BrokenResourceError from e
 
             if value is None or self._cscope.cancelled_caught:
                 raise EFDReadCancelled
@@ -209,20 +215,12 @@ class EventFD:
         opened with `EFD_NONBLOCK` its gonna block the thread.
 
         '''
-        return read_eventfd(self._fd)
+        return ll_read_eventfd(self._fd)
 
     def open(self):
-        self._fobj = os.fdopen(self._fd, self._omode)
         self._is_closed = False
 
     def close(self):
-        if self._fobj:
-            try:
-                self._fobj.close()
-
-            except OSError:
-                ...
-
         if self._cscope:
             self._cscope.cancel()
 
@@ -234,3 +232,18 @@ class EventFD:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+
+@asynccontextmanager
+async def open_eventfd(
+    fd: int | None = None,
+    omode: EFDOpenMode = 'rw',
+    sync_backend: EFDSyncMethods = 'epoll',
+    initval: int = 0,
+    flags: int = 0,
+) -> AsyncGenerator[EventFD, None]:
+    if fd is None:
+        fd = ll_open_eventfd(initval, flags)
+
+    with EventFD(fd, omode, sync_backend, get_async_backend()) as e:
+        yield e

@@ -807,12 +807,21 @@ class MemoryChannel:
     async def receive_exactly(self, num_bytes: int) -> bytes:
         return await self._receiver.receive_exactly(num_bytes)
 
-    async def receive(self) -> bytes:
-        return await self._receiver.receive()
+    async def receive(self, raw: bool = False) -> bytes:
+        return await self._receiver.receive(raw=raw)
 
     async def aclose(self):
         await self._receiver.aclose()
         await self._sender.aclose()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return await self.receive(raw=True)
+        except (anyio.EndOfStream, anyio.ClosedResourceError):
+            raise StopAsyncIteration
 
 
 @acm

@@ -1,17 +1,13 @@
 import time
-from hotbaud import MCToken
-from hotbaud.memchan._impl import (
-    attach_to_memory_receiver,
-    attach_to_memory_sender,
-)
+from hotbaud.experimental.pipeline import Port
 
 
 async def byte_fiend(
-    worker_id: str, in_token: MCToken, slot_size: int, msg_size: int
+    worker_id: str, in_port: Port, slot_size: int, msg_size: int, **kwargs
 ) -> None:
     slot_bytes = 0
     slot_mono = time.perf_counter()
-    async with attach_to_memory_receiver(in_token) as chan:
+    async with in_port.attach() as chan:
         async for msg in chan:
             slot_bytes += len(msg)
             if slot_bytes >= slot_size:
@@ -27,11 +23,11 @@ async def byte_fiend(
 
 
 async def byte_pusher(
-    worker_id: str, out_token: MCToken, amount_gb: int, msg_size: int
+    worker_id: str, out_port: Port, amount_gb: int, msg_size: int, **kwargs
 ) -> None:
     packet = b'1' * msg_size
     msg_amount = int((amount_gb * 1024 * 1024 * 1024) // msg_size)
     print(msg_amount)
-    async with attach_to_memory_sender(out_token) as chan:
+    async with out_port.attach() as chan:
         for _ in range(msg_amount):
             await chan.send(packet)

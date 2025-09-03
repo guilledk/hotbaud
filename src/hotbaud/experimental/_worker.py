@@ -42,19 +42,22 @@ import logging
 import pkgutil
 
 from typing import Any, AsyncGenerator, Callable, Self
-from logging import Logger
+from logging import Logger, getLogger
 from functools import partial
 from contextlib import asynccontextmanager
 
 import anyio
 import msgspec
 
-from hotbaud._utils import MessageStruct, make_partial, namespace_for
+from hotbaud._utils import MessageStruct, coerce_msgspec_bound_args, make_partial, namespace_for
 from hotbaud.memchan._impl import MemoryChannel
 
 # eventualy move hotbaud.experimental.event into hotbaud.event and stop using
 # relative import
 from .event import Event
+
+
+log = getLogger(__name__)
 
 
 spec_env_var = 'HOTBAUD_WORKER_SPEC'
@@ -149,6 +152,8 @@ def worker_main() -> None:
     # mabye inject config
     if config := spec.unwrap_config():
         task.keywords['config'] = config
+
+    task = coerce_msgspec_bound_args(task)
 
     # maybe open exit event:
     # depending on the stage this worker belongs to it might need to wait on
@@ -268,14 +273,23 @@ async def run_in_worker(
 
         kwargs['pass_fds'].append(exit_fd)
 
-    async with await anyio.open_process(cmd, env=_env, **kwargs) as process:
+    async with await anyio.open_process(
+        cmd,
+        stderr=None,
+        stdout=None,
+        env=_env,
+        **kwargs
+    ) as process:
         try:
+            log.info(f'{worker_id} spawned')
             await process.wait()
 
         finally:
             # if process still running, attempt best-effort cleanup
             if process.returncode is None:
                 process.terminate()
+
+    log.info(f'{worker_id} finished run')
 
 
 if __name__ == '__main__':

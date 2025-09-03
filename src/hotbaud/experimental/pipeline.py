@@ -33,16 +33,18 @@ Meant for:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import os
 import enum
 import logging
 
-from typing import Any, Awaitable, Callable, Generator, Protocol, Sequence
+from typing import Any, AsyncGenerator, Awaitable, Callable, Generator, Protocol, Sequence
 from pathlib import Path
 from functools import partial
 from dataclasses import dataclass
 
 import anyio
+from hotbaud.memchan._impl import attach_to_memory_channel
 import msgspec
 
 from hotbaud.eventfd import (
@@ -56,15 +58,36 @@ from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
     MCToken,
     alloc_memory_channel,
+    attach_to_memory_channel,
+    MemoryChannel
 )
 
-from hotbaud._utils import make_partial, oom_self_reaper
-from hotbaud._fdshare import fdshare_server_task, open_fd_share_socket
+from hotbaud._utils import MessageStruct, make_partial, maybe_oom_self_reaper
+from hotbaud._fdshare import fdshare_server_task
 
 from hotbaud.experimental._worker import run_in_worker
 
 
 log = logging.getLogger(__name__)
+
+
+class Port(MessageStruct, frozen=True):
+    '''
+    A worker-facing 'port': tokens in the correct orientation for this worker.
+    Use: attach_to_memory_channel(port.in_token, port.out_token)
+
+    '''
+    in_token:  MCToken  # used to RECEIVE by this worker
+    out_token: MCToken  # used to SEND by this worker
+
+    @asynccontextmanager
+    async def attach(self, **kwargs) -> AsyncGenerator[MemoryChannel, None]:
+        async with attach_to_memory_channel(
+            self.in_token,
+            self.out_token,
+            **kwargs
+        ) as channel:
+            yield channel
 
 
 class ConnectionStrategy(enum.StrEnum):
@@ -125,14 +148,17 @@ class StageDef:
 @dataclass(slots=True)
 class ChannelDef:
     '''
-    Metadata about one logical IPC memory channel.
+    A *duplex* logical link between two stages:
+      <name>.fwd : upstream -> downstream
+      <name>.bwd : downstream -> upstream
 
     '''
-
     name: str
-    shm: SharedMemory | None = None
-    token: MCToken | None = None
-    buf_size: int = 64 * 1024  # 64kb
+    shm_fwd: SharedMemory | None = None
+    tok_fwd: MCToken | None = None
+    shm_bwd: SharedMemory | None = None
+    tok_bwd: MCToken | None = None
+    buf_size: int = 64 * 1024
 
 
 class PipelineBuilder:
@@ -370,14 +396,19 @@ class PipelineBuilder:
 
         '''
         for cdef in self._channels.values():
-            key = f'{self.pipe_id}.{cdef.name}'
-            (
-                cdef.shm,
-                cdef.token,
-            ) = alloc_memory_channel(
-                key,
+            base = f'{self.pipe_id}.{cdef.name}'
+            # forward path (upstream -> downstream)
+            cdef.shm_fwd, cdef.tok_fwd = alloc_memory_channel(
+                f'{base}.fwd',
                 buf_size=cdef.buf_size,
-                share_path=str(self._socket_dir / f'{key}.sock'),
+                share_path=str(self._socket_dir / f'{base}.fwd.sock'),
+                sync_backend=self._sync_backend,
+            )
+            # backward path (downstream -> upstream)
+            cdef.shm_bwd, cdef.tok_bwd = alloc_memory_channel(
+                f'{base}.bwd',
+                buf_size=cdef.buf_size,
+                share_path=str(self._socket_dir / f'{base}.bwd.sock'),
                 sync_backend=self._sync_backend,
             )
 
@@ -396,38 +427,56 @@ class PipelineBuilder:
         workers: list[PipelineWorker] = []
 
         for sdef in self._stages:
-            # inject, depending on topology, the input and/or output token or
-            # tokens into the function's `in_token(s)` & `out_token(s)` keyword
+            # inject, depending on topology, the input and/or output port or
+            # ports into the function's `in_port(s)` & `out_port(s)` keyword
             # arguments
             for idx in range(sdef.size):
                 func = partial(sdef.func)  # fresh copy
                 kw: dict[str, Any] = {}
 
-                # input side
+                # input side (this worker is *downstream* of these links)
                 if sdef.inputs:
-                    in_toks = [self._channels[ch].token for ch in sdef.inputs]
-                    if sdef.strategy is ConnectionStrategy.MANY_TO_ONE:
-                        kw['in_tokens'] = in_toks  # N -> 1
-                    elif (
-                        sdef.strategy is ConnectionStrategy.ONE_TO_ONE
-                        and len(in_toks) >= sdef.size
-                    ):
-                        kw['in_token'] = in_toks[idx]  # 1 -> 1
-                    else:
-                        kw['in_token'] = in_toks[0]  # single input
+                    def _down_port(name: str) -> Port:
+                        ch = self._channels[name]
+                        return Port(in_token=ch.tok_fwd, out_token=ch.tok_bwd)
 
-                # output side
-                if sdef.outputs:
-                    out_toks = [self._channels[ch].token for ch in sdef.outputs]
-                    if sdef.strategy is ConnectionStrategy.ONE_TO_MANY:
-                        kw['out_tokens'] = out_toks  # 1 -> N
-                    elif (
-                        sdef.strategy is ConnectionStrategy.ONE_TO_ONE
-                        and len(out_toks) >= sdef.size
-                    ):
-                        kw['out_token'] = out_toks[idx]  # 1 -> 1
+                    in_names = list(sdef.inputs)
+                    if sdef.strategy is ConnectionStrategy.MANY_TO_ONE:
+                        in_ports = [_down_port(n) for n in in_names]  # N -> 1
+
+                    elif (sdef.strategy is ConnectionStrategy.ONE_TO_ONE
+                          and len(in_names) >= sdef.size):
+                        in_ports = [_down_port(in_names[idx])]  # 1 -> 1
+
                     else:
-                        kw['out_token'] = out_toks[0]  # single output
+                        in_ports = [_down_port(in_names[0])]  # single inputs
+
+                    if len(in_ports) == 1:
+                        kw['in_port'] = in_ports[0]
+
+                    else:
+                        kw['in_ports'] = in_ports
+
+                # output side (this worker is *upstream* of these links)
+                if sdef.outputs:
+                    def _up_port(name: str) -> Port:
+                        ch = self._channels[name]
+                        return Port(in_token=ch.tok_bwd, out_token=ch.tok_fwd)
+
+                    out_names = list(sdef.outputs)
+                    if sdef.strategy is ConnectionStrategy.ONE_TO_MANY:
+                        out_ports = [_up_port(n) for n in out_names]  # 1 -> N
+                    elif (sdef.strategy is ConnectionStrategy.ONE_TO_ONE
+                          and len(out_names) >= sdef.size):
+                        out_ports = [_up_port(out_names[idx])]  # 1 -> 1
+                    else:
+                        out_ports = [_up_port(out_names[0])]  # single output
+
+                    if len(out_ports) == 1:
+                        kw['out_port'] = out_ports[0]
+
+                    else:
+                        kw['out_ports'] = out_ports
 
                 func.keywords.update(kw)
 
@@ -543,7 +592,7 @@ class Pipeline:
         self,
         *,
         spawn_fn: WorkerSpawnFn = run_in_worker,
-        oom_reap_pct: float = 0.9,
+        oom_reap_pct: float | None = 0.9,
     ) -> None:
         '''
         Long running pipeline task.
@@ -551,18 +600,15 @@ class Pipeline:
         Start all fdshare tasks for channels that need it, then spawn stages
 
         '''
-        with oom_self_reaper(kill_at_pct=oom_reap_pct):
+        with maybe_oom_self_reaper(oom_reap_pct):
             async with anyio.create_task_group() as tg:
                 # channels with .token.share_path need a task spawned to open the
                 # socket and pass the fds to clients
                 for c in self.channels.values():
-                    assert c.token, 'Expected {c.name} to have token at this point'
-                    if c.token.share_path:
-                        tg.start_soon(
-                            fdshare_server_task,
-                            Path(c.token.share_path),
-                            c.token.fds,
-                        )
+                    for tok in (c.tok_fwd, c.tok_bwd):
+                        assert tok, f'Expected {c.name} to have tokens at this point'
+                        if tok.share_path:
+                            tg.start_soon(fdshare_server_task, Path(tok.share_path), tok.fds)
 
                 # use an inner tg in order to have separate task scopes for
                 # stage tasks & fd share tasks
@@ -589,6 +635,7 @@ class Pipeline:
 
     async def __aexit__(self, exc_type, exc, tb):
         for c in self.channels.values():
-            if c.shm is not None:
-                c.shm.close()
-                c.shm.unlink()
+            if c.shm_fwd is not None:
+                c.shm_fwd.close(); c.shm_fwd.unlink()
+            if c.shm_bwd is not None:
+                c.shm_bwd.close(); c.shm_bwd.unlink()

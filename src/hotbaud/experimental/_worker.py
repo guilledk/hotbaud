@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -35,10 +35,10 @@ contains the worker id & all the info necesary on what and how to run the
 partial originally passed to `run_in_worker`.
 
 '''
+
 import os
 import sys
 import logging
-import inspect
 import pkgutil
 
 from typing import Any, AsyncGenerator, Callable, Self
@@ -46,8 +46,7 @@ from logging import Logger
 from functools import partial
 from contextlib import asynccontextmanager
 
-import trio
-import trio_asyncio
+import anyio
 import msgspec
 
 from hotbaud._utils import MessageStruct, make_partial, namespace_for
@@ -70,16 +69,15 @@ class TaskSpec(MessageStruct, frozen=True):
     fn: str  # namespace string (valid for pkgutil.resolve_name)
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
-
-    is_async: bool
+    async_lib: str | None
 
     @classmethod
-    def from_partial(cls, p: partial) -> Self:
+    def from_partial(cls, p: partial, async_lib: str | None = None) -> Self:
         return cls(
             fn=namespace_for(p.func),
             args=p.args,
             kwargs=p.keywords,
-            is_async=inspect.iscoroutinefunction(p.func),
+            async_lib=async_lib,
         )
 
     def to_partial(self) -> partial:
@@ -89,14 +87,13 @@ class TaskSpec(MessageStruct, frozen=True):
 class WorkerSpec(MessageStruct, frozen=True):
     '''
     Metadata that worker process needs to run a "task", which can be a
-    callable or awaitable (trio or asyncio style)
+    callable or awaitable (any supported by anyio)
 
     '''
 
     id: str
     task: TaskSpec
     exit_fd: int | None
-    asyncio: bool = False
     config: dict | None = None
     config_type: str | None = None
     log_setup: str | None = None
@@ -150,7 +147,7 @@ def worker_main() -> None:
     task.keywords['worker_id'] = spec.id
 
     # mabye inject config
-    if (config := spec.unwrap_config()):
+    if config := spec.unwrap_config():
         task.keywords['config'] = config
 
     # maybe open exit event:
@@ -168,11 +165,8 @@ def worker_main() -> None:
 
     try:
         # finally run unwrapped user task, choose right runtime based on params
-        if spec.task.is_async:
-            if not spec.asyncio:
-                trio.run(task)
-            else:
-                trio_asyncio.run(task)
+        if spec.task.async_lib:
+            anyio.run(task, backend=spec.task.async_lib)
 
         else:
             task()
@@ -197,8 +191,7 @@ def worker_main() -> None:
                 # just log warning and exit, we dont want to hide any real
                 # errors
                 log.warning(
-                    'failed read on exit event, stopping...',
-                    exc_info=e
+                    'failed read on exit event, stopping...', exc_info=e
                 )
 
         else:
@@ -214,11 +207,11 @@ async def run_in_worker(
     task: partial,
     exit_fd: int | None,
     *,
-    asyncio: bool = False,
+    async_lib: str | None = None,
     config: dict | msgspec.Struct | None,
     log_setup: Callable[[], None] | None,
     env: dict[str, str] | None,
-    **kwargs
+    **kwargs,
 ) -> None:
     '''
     Run a callable or awaitable (trio or asyncio style) function inside a
@@ -235,14 +228,10 @@ async def run_in_worker(
     if config is not None:
         # pass config dict or struct as well as info to re-build it if its a struct
         config_type = (
-            'dict'
-            if isinstance(config, dict)
-            else namespace_for(type(config))
+            'dict' if isinstance(config, dict) else namespace_for(type(config))
         )
         config_dict = (
-            config
-            if isinstance(config, dict)
-            else msgspec.to_builtins(config)
+            config if isinstance(config, dict) else msgspec.to_builtins(config)
         )
 
     # also pass namespace of log_setup function if user passed it
@@ -251,12 +240,11 @@ async def run_in_worker(
     # pack everything we need into env var
     spec = WorkerSpec(
         id=worker_id,
-        task=TaskSpec.from_partial(task),
+        task=TaskSpec.from_partial(task, async_lib=async_lib),
         exit_fd=exit_fd,
         config=config_dict,
         config_type=config_type,
-        asyncio=asyncio,
-        log_setup=log_setup_ns
+        log_setup=log_setup_ns,
     )
 
     _env = os.environ.copy()
@@ -280,17 +268,14 @@ async def run_in_worker(
 
         kwargs['pass_fds'].append(exit_fd)
 
-    process: trio.Process = await trio.lowlevel.open_process(
-        cmd, env=_env, **kwargs
-    )
+    async with await anyio.open_process(cmd, env=_env, **kwargs) as process:
+        try:
+            await process.wait()
 
-    try:
-        await process.wait()
-
-    finally:
-        # if process still running, attempt best-effort cleanup
-        if process.returncode is None:
-            process.terminate()
+        finally:
+            # if process still running, attempt best-effort cleanup
+            if process.returncode is None:
+                process.terminate()
 
 
 if __name__ == '__main__':
@@ -302,6 +287,7 @@ Run function in sub-process & setup IPC msg channels
 
 '''
 
+
 @asynccontextmanager
 async def open_worker(
     target_fn: partial | Callable,
@@ -311,8 +297,8 @@ async def open_worker(
     config: dict | msgspec.Struct | None,
     log_setup: Callable[[], None] | None = None,
     cancel: bool = True,
-    asyncio: bool = False,
-    env: dict[str, str] | None = None
+    async_lib: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> AsyncGenerator[MemoryChannel, None]:
     from hotbaud import open_memory_channel, attach_to_memory_channel
 
@@ -329,32 +315,29 @@ async def open_worker(
     async with (
         open_memory_channel(f'{full_worker_id}.req') as req_token,
         open_memory_channel(f'{full_worker_id}.res') as res_token,
-        attach_to_memory_channel(res_token, req_token) as chan
+        attach_to_memory_channel(res_token, req_token) as chan,
     ):
         target_fn.keywords.update({
             'req_token': req_token,
-            'res_token': res_token
+            'res_token': res_token,
         })
 
-        async with trio.open_nursery() as n:
-            n.start_soon(
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
                 partial(
                     run_in_worker,
                     worker_id=full_worker_id,
                     task=target_fn,
                     exit_fd=None,
-                    asyncio=asyncio,
+                    async_lib=async_lib,
                     config=config,
                     log_setup=log_setup,
                     env=env,
-                    pass_fds=(
-                        *req_token.fds,
-                        *res_token.fds
-                    )
+                    pass_fds=(*req_token.fds, *res_token.fds),
                 )
             )
             yield chan
             if cancel:
-                n.cancel_scope.cancel()
+                tg.cancel_scope.cancel()
 
     return

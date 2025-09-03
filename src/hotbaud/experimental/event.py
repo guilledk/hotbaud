@@ -35,23 +35,33 @@ until a read(2) is performed on the file descriptor, or fails with the error
 EAGAIN if the file descriptor has been made nonblocking.
 
 '''
+
 import os
 
-from typing import Generator, Type
-from contextlib import contextmanager
+from typing import AsyncGenerator, Generator, Type
+from contextlib import asynccontextmanager, contextmanager
 
-import trio
-from hotbaud.eventfd import EFD_NONBLOCK, EFD_SEMAPHORE, open_eventfd, read_eventfd, write_eventfd
+from anyio.abc import AsyncBackend
+from anyio._core._eventloop import get_async_backend
+
+from hotbaud.eventfd import (
+    EFD_NONBLOCK,
+    EFD_SEMAPHORE,
+    ll_open_eventfd,
+    ll_read_eventfd,
+    ll_write_eventfd,
+)
 
 
-default_set_value = (2 ** 64) - 2
+default_set_value = (2**64) - 2
 
 
-class EventCommon:
+class Event:
     '''
     Common between sync & async Event impls
 
     '''
+
     def __init__(self, fd: int, value: int = default_set_value):
         self._fd = fd
         self._is_set = False
@@ -79,27 +89,35 @@ class EventCommon:
 
         '''
         self._ensure_unset()
-        write_eventfd(self._fd, self.value)
+        ll_write_eventfd(self._fd, self.value)
         self._is_set = True
 
-
-class Event(EventCommon):
     def wait(self) -> None:
         self._ensure_unset()
-        read_eventfd(self._fd)
+        ll_read_eventfd(self._fd)
         self._is_set = True
 
 
-class AsyncEvent(EventCommon):
+class AsyncEvent(Event):
     '''
     Same as Event but using trio async
     (requires non blocking flag EFD_NONBLOCK on fd open)
 
     '''
-    async def wait(self) -> None:
+
+    def __init__(
+        self,
+        fd: int,
+        async_backend: type[AsyncBackend],
+        value: int = default_set_value,
+    ):
+        super().__init__(fd, value=value)
+        self._async_backend = async_backend
+
+    async def wait_async(self) -> None:
         self._ensure_unset()
-        await trio.lowlevel.wait_readable(self._fd)
-        read_eventfd(self._fd)
+        await self._async_backend.wait_readable(self._fd)
+        ll_read_eventfd(self._fd)
         self._is_set = True
 
 
@@ -107,9 +125,8 @@ class AsyncEvent(EventCommon):
 def open_event(
     value: int = default_set_value,
     mode: str = 'rw',
-    flags: int | None = None,
-    event_type: Type[EventCommon] = Event
-) -> Generator[EventCommon, None, None]:
+    flags: int = EFD_SEMAPHORE,
+) -> Generator[Event, None, None]:
     '''
     Allocate and manage resources for an EventCommon subclass
 
@@ -119,16 +136,25 @@ def open_event(
     event_type: choose EventCommon subclass to yield
 
     '''
-    flags = (
-        (EFD_NONBLOCK if event_type == AsyncEvent else 0) | EFD_SEMAPHORE
-        if flags is None
-        else flags
-    )
-
-    fd = open_eventfd(flags=flags)
+    fd = ll_open_eventfd(flags=flags)
     fobj = os.fdopen(fd, mode)
 
-    yield event_type(fd, value=value)
+    yield Event(fd, value=value)
+
+    if fobj:
+        fobj.close()
+
+
+@asynccontextmanager
+async def open_async_event(
+    value: int = default_set_value,
+    mode: str = 'rw',
+    flags: int = EFD_NONBLOCK | EFD_SEMAPHORE,
+) -> AsyncGenerator[AsyncEvent, None]:
+    fd = ll_open_eventfd(flags=flags)
+    fobj = os.fdopen(fd, mode)
+
+    yield AsyncEvent(fd, value=value, async_backend=get_async_backend())
 
     if fobj:
         fobj.close()
@@ -139,8 +165,8 @@ def attach_event(
     fd: int,
     value: int = default_set_value,
     mode: str = 'rw',
-    event_type: Type[EventCommon] = Event
-) -> Generator[EventCommon, None, None]:
+    event_type: Type[Event] = Event,
+) -> Generator[Event, None, None]:
     '''
     Attach to an already opened Event
 

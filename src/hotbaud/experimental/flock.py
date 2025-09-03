@@ -1,26 +1,27 @@
 '''
-Filesystem `flock` based `trio.Lock` like impl
+Filesystem `flock` based `anyio.Lock` like impl
 
 TODO: docstring
 
 '''
+
 import os
 
 from fcntl import flock, LOCK_EX, LOCK_UN
 
 from pathlib import Path
 
-import trio
-
+import anyio
 
 open_mode = os.O_RDWR | os.O_CREAT | os.O_TRUNC
 
 
-class LockCommon:
+class Lock:
     '''
     Common between sync & async Lock impls
 
     '''
+
     def __init__(self, path: str | Path):
         self._path = Path(path)
         self._fd = 0
@@ -54,8 +55,6 @@ class LockCommon:
         flock(self._fd, LOCK_UN)
         self._locked = False
 
-
-class Lock(LockCommon):
     def acquire(self) -> None:
         if self._locked:
             return
@@ -65,7 +64,7 @@ class Lock(LockCommon):
 
     def __enter__(self):
         self._open()
-        self.acquire();
+        self.acquire()
         return self
 
     def __exit__(self, *_):
@@ -73,24 +72,24 @@ class Lock(LockCommon):
         self._close()
 
 
-class AsyncLock(LockCommon):
+class AsyncLock(Lock):
     '''
     Same as Lock but using trio async
 
     '''
-    async def acquire(self) -> None:
+
+    async def acquire_async(self) -> None:
         if self._locked:
             return
 
-        await trio.to_thread.run_sync(
-            flock, self._fd, LOCK_EX,
-            abandon_on_cancel=True
+        await anyio.to_thread.run_sync(
+            flock, self._fd, LOCK_EX, abandon_on_cancel=True
         )
         self._locked = True
 
     async def __aenter__(self):
         self._open()
-        await self.acquire();
+        await self.acquire_async()
         return self
 
     async def __aexit__(self, *_):

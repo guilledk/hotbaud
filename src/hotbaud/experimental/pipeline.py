@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# 
+#
 # Copyright © 2025 Guillermo Rodriguez & Tyler Goodlet
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -42,11 +42,15 @@ from pathlib import Path
 from functools import partial
 from dataclasses import dataclass
 
+import anyio
 import msgspec
-import trio
-from trio.socket import SocketType
 
-from hotbaud.eventfd import EFD_SEMAPHORE, EFDSyncMethods, default_sync_method, open_eventfd
+from hotbaud.eventfd import (
+    EFD_SEMAPHORE,
+    EFDSyncMethods,
+    default_sync_method,
+    ll_open_eventfd,
+)
 from hotbaud.experimental.event import Event
 from hotbaud.types import SharedMemory
 from hotbaud.memchan import (
@@ -55,7 +59,7 @@ from hotbaud.memchan import (
 )
 
 from hotbaud._utils import make_partial, oom_self_reaper
-from hotbaud._fdshare import open_fd_share_socket
+from hotbaud._fdshare import fdshare_server_task, open_fd_share_socket
 
 from hotbaud.experimental._worker import run_in_worker
 
@@ -103,7 +107,7 @@ class StageDef:
     func: partial
     exit_fd: Event | None
     size: int = 1
-    asyncio: bool = False
+    async_lib: str | None = None
 
     # channel aliases scoped to this stage
     inputs: Sequence[str] = ()
@@ -127,21 +131,8 @@ class ChannelDef:
 
     name: str
     shm: SharedMemory | None = None
-    share_sock: SocketType | None = None
     token: MCToken | None = None
     buf_size: int = 64 * 1024  # 64kb
-
-    async def fdshare_task(self) -> None:
-        if self.share_sock is None:
-            raise RuntimeError(
-                'Started fdshare_task on a None self.share_sock ?'
-            )
-
-        if self.token is None:
-            raise RuntimeError('Started fdshare_task on a None self.token ?')
-
-        async with open_fd_share_socket(self.share_sock, self.token.fds):
-            await trio.sleep_forever()
 
 
 class PipelineBuilder:
@@ -157,7 +148,7 @@ class PipelineBuilder:
         global_config: dict | msgspec.Struct | None = None,
         log_setup: Callable[[], None] | None = None,
         sync_backend: EFDSyncMethods = default_sync_method,
-        share_path: Path | str = Path('.hotbaud/share')
+        share_path: Path | str = Path('.hotbaud/share'),
     ):
         self.pipe_id = pipe_id
         self._config = global_config
@@ -178,7 +169,7 @@ class PipelineBuilder:
         in_size: int = 64 * 1024,
         outputs: str | Sequence[str] | None = None,
         out_size: int = 64 * 1024,
-        asyncio: bool = False,
+        async_lib: str | None = None,
         size: int = 1,
         strategy: ConnectionStrategy | str = ConnectionStrategy.ONE_TO_ONE,
     ) -> PipelineBuilder:
@@ -211,7 +202,7 @@ class PipelineBuilder:
             if isinstance(outputs, str)
             else tuple(outputs or ()),
             out_size=out_size,
-            asyncio=asyncio,
+            async_lib=async_lib,
             strategy=strat,
         )
         self._stages.append(sdef)
@@ -235,7 +226,7 @@ class PipelineBuilder:
         in_size: int = 64 * 1024,
         outputs: str | Sequence[str] | None = None,
         out_size: int = 64 * 1024,
-        asyncio: bool = False,
+        async_lib: str | None = None,
         size: int = 1,
     ) -> PipelineBuilder:
         '''
@@ -249,7 +240,7 @@ class PipelineBuilder:
             in_size=in_size,
             outputs=outputs,
             out_size=out_size,
-            asyncio=asyncio,
+            async_lib=async_lib,
             size=size,
             strategy=ConnectionStrategy.ONE_TO_MANY,
         )
@@ -263,7 +254,7 @@ class PipelineBuilder:
         in_size: int = 64 * 1024,
         output: str | None = None,
         out_size: int = 64 * 1024,
-        asyncio: bool = False,
+        async_lib: str | None = None,
         size: int = 1,
     ) -> PipelineBuilder:
         '''
@@ -277,7 +268,7 @@ class PipelineBuilder:
             in_size=in_size,
             outputs=[output] if output else None,
             out_size=out_size,
-            asyncio=asyncio,
+            async_lib=async_lib,
             size=size,
             strategy=ConnectionStrategy.MANY_TO_ONE,
         )
@@ -322,7 +313,7 @@ class PipelineBuilder:
 
             exit_fd = None
             if idx > 0:
-                exit_fd = Event(open_eventfd(flags=EFD_SEMAPHORE))
+                exit_fd = Event(ll_open_eventfd(flags=EFD_SEMAPHORE))
 
             # build a fresh, *expanded* StageDef
             new_stages.append(
@@ -335,7 +326,7 @@ class PipelineBuilder:
                     in_size=s.in_size,
                     outputs=outs,
                     out_size=s.out_size,
-                    asyncio=s.asyncio,
+                    async_lib=s.async_lib,
                     strategy=s.strategy,
                 )
             )
@@ -373,7 +364,7 @@ class PipelineBuilder:
             upstream.strategy.validate(upstream.size, downstream.size)
             # we could extend validation here (channel compatibility etc.)
 
-    async def _alloc_channels(self) -> None:
+    def _alloc_channels(self) -> None:
         '''
         Allocate all the resources needed for the pipeline
 
@@ -383,15 +374,14 @@ class PipelineBuilder:
             (
                 cdef.shm,
                 cdef.token,
-                cdef.share_sock,
-            ) = await alloc_memory_channel(
+            ) = alloc_memory_channel(
                 key,
                 buf_size=cdef.buf_size,
                 share_path=str(self._socket_dir / f'{key}.sock'),
-                sync_backend=self._sync_backend
+                sync_backend=self._sync_backend,
             )
 
-    async def build(self) -> 'Pipeline':
+    def build(self) -> 'Pipeline':
         '''
         Materialise shared memory & return a :class:`Pipeline` instance.
 
@@ -401,8 +391,7 @@ class PipelineBuilder:
 
         self._auto_expand_channels()
         self._validate_topology()
-
-        await self._alloc_channels()
+        self._alloc_channels()
 
         workers: list[PipelineWorker] = []
 
@@ -446,7 +435,12 @@ class PipelineBuilder:
                 workers.append(PipelineWorker(id=wid, func=func, stage=sdef))
 
         return Pipeline(
-            self.pipe_id, self._stages, workers, self._channels, self._config, self._log_setup
+            self.pipe_id,
+            self._stages,
+            workers,
+            self._channels,
+            self._config,
+            self._log_setup,
         )
 
 
@@ -457,10 +451,10 @@ class WorkerSpawnFn(Protocol):
         task: partial,
         exit_fd: int | None,
         *,
-        asyncio: bool,
+        async_lib: str | None,
         config: dict | msgspec.Struct | None,
         log_setup: Callable[[], None] | None,
-        env: dict[str, str] | None
+        env: dict[str, str] | None,
     ) -> Awaitable[Any]: ...
 
 
@@ -484,7 +478,7 @@ class Pipeline:
         workers: list[PipelineWorker],
         channels: dict[str, ChannelDef],
         global_config: dict | msgspec.Struct | None,
-        log_setup: Callable[[], None] | None
+        log_setup: Callable[[], None] | None,
     ) -> None:
         self.pipe_id = pipe_id
         self.stages = stages
@@ -498,10 +492,9 @@ class Pipeline:
         stage: StageDef,
         *,
         spawn_fn: WorkerSpawnFn = run_in_worker,
-        task_status = trio.TASK_STATUS_IGNORED
+        task_status=anyio.TASK_STATUS_IGNORED,
     ) -> None:
-        '''
-        '''
+        ''' '''
         idx = self.stages.index(stage)
 
         # find next stage's exit_event
@@ -512,24 +505,20 @@ class Pipeline:
             exit_event = next_stage.exit_fd
 
         # gather this stage's workers
-        workers = tuple((
-            w
-            for w in self.workers
-            if w.stage == stage
-        ))
+        workers = tuple((w for w in self.workers if w.stage == stage))
 
-        async with trio.open_nursery() as nursery:
+        async with anyio.create_task_group() as tg:
             for w in workers:
-                nursery.start_soon(
+                tg.start_soon(
                     partial(
                         spawn_fn,
                         w.id,
                         w.func,
                         exit_event.fd if exit_event else None,
-                        asyncio=w.stage.asyncio,
+                        async_lib=w.stage.async_lib,
                         config=self.global_config,
                         log_setup=self.log_setup,
-                        env=None
+                        env=None,
                     )
                 )
 
@@ -545,13 +534,16 @@ class Pipeline:
                 log.info(f'stage {stage.id} set exit')
 
             except Exception as e:
-                log.warning(f'while setting stage {stage.id} (index: {idx}) exit event', exc_info=e)
+                log.warning(
+                    f'while setting stage {stage.id} (index: {idx}) exit event',
+                    exc_info=e,
+                )
 
     async def run(
         self,
         *,
         spawn_fn: WorkerSpawnFn = run_in_worker,
-        oom_reap_pct: float = .9
+        oom_reap_pct: float = 0.9,
     ) -> None:
         '''
         Long running pipeline task.
@@ -560,25 +552,25 @@ class Pipeline:
 
         '''
         with oom_self_reaper(kill_at_pct=oom_reap_pct):
-            async with trio.open_nursery() as nursery:
+            async with anyio.create_task_group() as tg:
                 # channels with .token.share_path need a task spawned to open the
                 # socket and pass the fds to clients
                 for c in self.channels.values():
                     assert c.token, 'Expected {c.name} to have token at this point'
                     if c.token.share_path:
-                        nursery.start_soon(c.fdshare_task)
+                        tg.start_soon(
+                            fdshare_server_task,
+                            Path(c.token.share_path),
+                            c.token.fds,
+                        )
 
-                # use an inner nursery in order to have separate task scopes for
+                # use an inner tg in order to have separate task scopes for
                 # stage tasks & fd share tasks
-                async with trio.open_nursery() as stage_nursery:
+                async with anyio.create_task_group() as stage_group:
                     # spawn all workers
                     for s in self.stages:
-                        await stage_nursery.start(
-                            partial(
-                                self.run_stage,
-                                s,
-                                spawn_fn=spawn_fn
-                            )
+                        await stage_group.start(
+                            partial(self.run_stage, s, spawn_fn=spawn_fn)
                         )
 
                     log.info(
@@ -587,10 +579,10 @@ class Pipeline:
                         f'{len(self.stages)} stages'
                     )
 
-                    # trio will now block on this scope until all stage tasks return
+                    # will now block on this scope until all stage tasks return
 
                 # cancel fd share tasks
-                nursery.cancel_scope.cancel()
+                tg.cancel_scope.cancel()
 
     async def __aenter__(self):
         return self

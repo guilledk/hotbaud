@@ -7,11 +7,10 @@ requires-python = '>=3.11'
 readme = 'README.md'
 license = 'MIT'
 dependencies = [
+    'anyio>=4.10.0',
     'cffi>=1.17.1',
     'msgspec>=0.19.0',
-    "psutil>=7.0.0",
-    'trio>=0.30.0',
-    'trio-asyncio>=0.15.0',
+    'psutil>=7.0.0',
 ]
 
 [tool.hatch.metadata]
@@ -33,7 +32,8 @@ build-backend = 'hatchling.build'
 [dependency-groups]
 dev = [
     'pytest>=8.4.1',
-    'pytest-trio>=0.8.0',
+    'pytest-anyio>=0.0.0',
+    'trio>=0.30.0',
 ]
 
 [tool.ruff]
@@ -63,4 +63,3 @@ docstring-quotes = 'single'
 addopts = [
   '--show-capture=no',
 ]
-trio_mode = true

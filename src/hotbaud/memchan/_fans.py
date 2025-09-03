@@ -32,7 +32,7 @@ import itertools
 from heapq import heappush, heappop
 from typing import AsyncGenerator, AsyncIterator, Awaitable, Protocol, Sequence
 
-import trio
+import anyio
 import msgspec
 
 from msgspec import Raw
@@ -65,7 +65,6 @@ class FanOutSendFn(Protocol):
 async def attach_fan_out_sender(
     out_tokens: Sequence[MCToken],
     *,
-    batch_size: int = 1,
     ordered: bool = False,
 ) -> AsyncGenerator[FanOutSendFn, None]:
     if not out_tokens:
@@ -76,9 +75,7 @@ async def attach_fan_out_sender(
 
     async with AsyncExitStack() as stack:
         senders = [
-            await stack.enter_async_context(
-                attach_to_memory_sender(t, batch_size=batch_size)
-            )
+            await stack.enter_async_context(attach_to_memory_sender(t))
             for t in out_tokens
         ]
 
@@ -90,9 +87,9 @@ async def attach_fan_out_sender(
             )
 
             if broadcast:
-                async with trio.open_nursery() as n:
+                async with anyio.create_task_group() as tg:
                     for sender in senders:
-                        n.start_soon(sender.send, raw)
+                        tg.start_soon(sender.send, raw)
 
                 return
 
@@ -115,9 +112,9 @@ async def attach_fan_in_receiver(
     if len(in_tokens) < 2:
         raise ValueError('attach_fan_in_receiver expects ≥2 tokens')
 
-    send, recv = trio.open_memory_channel(0)
+    send, recv = anyio.create_memory_object_stream[bytes](0)
 
-    async with trio.open_nursery() as nursery, AsyncExitStack() as stack:
+    async with anyio.create_task_group() as nursery, AsyncExitStack() as stack:
         # open all upstream receivers
         receivers = [
             await stack.enter_async_context(attach_to_memory_receiver(t))
@@ -131,10 +128,10 @@ async def attach_fan_in_receiver(
                     await send.send((idx, msg))
                 await send.send((idx, None))  # sentinel
 
-            except trio.WouldBlock:
+            except anyio.WouldBlock:
                 ...
 
-            except trio.ClosedResourceError:
+            except anyio.ClosedResourceError:
                 ...
 
         for i, r in enumerate(receivers):

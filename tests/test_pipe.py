@@ -1,5 +1,6 @@
 from functools import partial
 
+from hotbaud._log import setup_logging
 from hotbaud.eventfd import EFDSyncMethods
 import pytest
 
@@ -44,6 +45,7 @@ async def test_throughput(
     builder = (
         PipelineBuilder(
             'pusher-fiend-pattern',
+            log_setup=setup_logging,
             sync_backend=sync_backend,
             share_path=tmp_path_factory.mktemp('.hotbaud'),
         )
@@ -52,12 +54,14 @@ async def test_throughput(
             partial(byte_pusher, amount_gb=amount_gb, msg_size=msg_size),
             outputs='bytes',
             out_size=buf_size,
+            async_lib='trio'
         )
         .stage(
             'fiend',
             partial(byte_fiend, slot_size=slot_size, msg_size=msg_size),
             inputs='bytes',
             in_size=buf_size,
+            async_lib='trio'
         )
     )
 

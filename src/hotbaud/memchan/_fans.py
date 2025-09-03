@@ -30,7 +30,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 import itertools
 
 from heapq import heappush, heappop
-from typing import AsyncGenerator, AsyncIterator, Awaitable, Protocol, Sequence
+from typing import AsyncGenerator, AsyncIterator, Awaitable, Literal, Protocol, Sequence
 
 import anyio
 import msgspec
@@ -61,11 +61,15 @@ class FanOutSendFn(Protocol):
     ) -> Awaitable[None]: ...
 
 
+FanOutStrategy = Literal['turns', 'smart', 'direct']
+
+
 @asynccontextmanager
 async def attach_fan_out_sender(
     out_tokens: Sequence[MCToken],
     *,
     ordered: bool = False,
+    strategy: FanOutStrategy = 'smart'
 ) -> AsyncGenerator[FanOutSendFn, None]:
     if not out_tokens:
         raise ValueError('attach_fan_out_sender expects at least one token')
@@ -79,7 +83,14 @@ async def attach_fan_out_sender(
             for t in out_tokens
         ]
 
-        async def send(payload: Buffer, broadcast: bool = False) -> None:
+        smap = {t.shm_name: sender for t, sender in zip(out_tokens, senders)}
+
+        async def send(
+            payload: Buffer,
+            *,
+            broadcast: bool = False,
+            target: str | None = None
+        ) -> None:
             raw = (
                 OrderedMsg(index=seq(), msg=payload).encode()
                 if ordered
@@ -93,9 +104,22 @@ async def attach_fan_out_sender(
 
                 return
 
-            nonlocal rr_idx
-            sender = senders[rr_idx]
-            rr_idx = (rr_idx + 1) % len(senders)
+            match strategy:
+                case 'turns':
+                    nonlocal rr_idx
+                    sender = senders[rr_idx]
+                    rr_idx = (rr_idx + 1) % len(senders)
+
+                case 'smart':
+                    sender = min(
+                        senders,
+                        key=lambda s: s.write_ptr - s.read_ptr
+                    )
+
+                case 'direct':
+                    assert target, 'must provide target on direct mode!'
+                    sender = smap[target]
+
 
             await sender.send(raw)
 

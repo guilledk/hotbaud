@@ -12,6 +12,12 @@ from hotbaud.memchan._impl import (
     open_memory_channel,
 )
 
+pytest.mark.skip(
+    sys.platform != 'linux',
+    reason='Linux-only: relies on eventfd(2)',
+    allow_module_level=True
+)
+
 
 def sender_process(
     token: MCToken,
@@ -32,15 +38,6 @@ def receiver_process(token: MCToken) -> list[str]:
             return [msg.decode() async for msg in receiver]
 
     return anyio.run(_main, backend='trio')
-
-
-pytestmark = [
-    pytest.mark.anyio,
-    pytest.mark.skipif(
-        sys.platform != 'linux',
-        reason='Linux-only: relies on eventfd(2)',
-    ),
-]
 
 
 def _shm_name() -> str:

@@ -7,8 +7,9 @@ requires-python = '>=3.11'
 readme = 'README.md'
 license = 'MIT'
 dependencies = [
-    'anyio>=4.10.0',
+    'anyio[trio]>=4.10.0',
     'cffi>=1.17.1',
+    'colorlog>=6.9.0',
     'msgspec>=0.19.0',
     'psutil>=7.0.0',
 ]
@@ -33,7 +34,6 @@ build-backend = 'hatchling.build'
 dev = [
     'pytest>=8.4.1',
     'pytest-anyio>=0.0.0',
-    'trio>=0.30.0',
 ]
 
 [tool.ruff]
